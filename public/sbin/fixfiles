@@ -1,0 +1,314 @@
+#!/bin/bash
+# fixfiles
+#
+# Script to restore labels on a SELinux box
+#
+# Copyright (C) 2004-2009 Red Hat, Inc.
+# Authors: Dan Walsh <dwalsh@redhat.com>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+#
+# Get all mounted rw file systems that support seclabel
+#
+get_labeled_mounts() {
+# /dev is not listed in the mountab
+FS="`mount | egrep -v '\((|.*,)bind(,.*|)\)' | awk '/\(rw/{print $3}';` /dev"
+for i in $FS; do 
+    grep --silent "$i ".*seclabel /proc/self/mounts && echo $i
+done
+}
+
+exclude_dirs_from_relabelling() {
+    exclude_from_relabelling=
+    if [ -e /etc/selinux/fixfiles_exclude_dirs ]
+    then
+    while read i
+    do
+        # skip blank line and comment
+        # skip not absolute path
+        # skip not directory
+        [ -z "${i}" ] && continue
+        [[ "${i}" =~ "^[[:blank:]]*#" ]] && continue
+        [[ ! "${i}" =~ ^/.* ]] && continue
+        [[ ! -d "${i}" ]] && continue
+        exclude_from_relabelling="$exclude_from_relabelling -e $i"
+        logit "skipping the directory $i from relabelling"
+    done < /etc/selinux/fixfiles_exclude_dirs
+    fi
+    echo "$exclude_from_relabelling"
+}
+
+exclude_dirs() {
+    exclude=
+    for i in /sys /proc /dev /run /mnt /var/tmp /var/lib/BackupPC /home /tmp /dev; do
+    [ -e $i ]  && exclude="$exclude -e $i";
+    done
+    exclude="$exclude `exclude_dirs_from_relabelling`"
+    echo "$exclude"
+}
+
+#
+# Set global Variables
+#
+fullFlag=0
+FORCEFLAG=""
+DIRS=""
+RPMILES=""
+LOGFILE=`tty`
+if [ $? != 0 ]; then
+    LOGFILE="/dev/null"
+fi
+SYSLOGFLAG="-l"
+LOGGER=/usr/sbin/logger
+SETFILES=/sbin/setfiles
+RESTORECON=/sbin/restorecon
+FILESYSTEMS=`get_labeled_mounts`
+SELINUXTYPE="targeted"
+if [ -e /etc/selinux/config ]; then
+    . /etc/selinux/config
+    FC=/etc/selinux/${SELINUXTYPE}/contexts/files/file_contexts 
+else
+    FC=/etc/security/selinux/file_contexts
+fi
+
+#
+# Log to either syslog or a LOGFILE
+#
+logit () {
+if [ -n $LOGFILE ]; then
+    echo $1 >> $LOGFILE
+fi
+}
+#
+# Compare PREVious File Context to currently installed File Context and 
+# run restorecon on all files affected by the differences.
+#
+diff_filecontext() {
+if [ -f ${PREFC} -a -x /usr/bin/diff ]; then
+	TEMPFILE=`mktemp ${FC}.XXXXXXXXXX`
+	test -z "$TEMPFILE" && exit
+	PREFCTEMPFILE=`mktemp ${PREFC}.XXXXXXXXXX`
+	sed -r -e 's,:s0, ,g' $PREFC | sort -u > ${PREFCTEMPFILE}
+	sed -r -e 's,:s0, ,g' $FC | sort -u | \
+	/usr/bin/diff -b ${PREFCTEMPFILE} - | \
+	    grep '^[<>]'|cut -c3-| grep ^/ | \
+	    egrep -v '(^/home|^/root|^/tmp|^/dev)' |\
+	sed -r -e 's,[[:blank:]].*,,g' \
+               -e 's|\(([/[:alnum:]]+)\)\?|{\1,}|g' \
+	       -e 's|([/[:alnum:]])\?|{\1,}|g' \
+               -e 's|\?.*|*|g' \
+	       -e 's|\(.*|*|g' \
+	       -e 's|\[.*|*|g' \
+               -e 's|\.\*.*|*|g' \
+               -e 's|\.\+.*|*|g' | \
+	    # These two sorts need to be separate commands \
+	sort -u | \
+	sort -d | \
+        while read pattern ; \
+	    do if ! echo "$pattern" | grep -q -f ${TEMPFILE} 2>/dev/null; then \
+                  echo "$pattern"; \
+                  case "$pattern" in *"*") \
+	               echo "$pattern" | sed -e 's,^,^,' -e 's,\*$,,g' >> ${TEMPFILE};;  
+                  esac; \
+               fi; \
+            done | \
+		      ${RESTORECON} -i -f - -R -p  `exclude_dirs`; \
+	rm -f ${TEMPFILE} ${PREFCTEMPFILE}
+fi
+}
+
+rpmlist() {
+rpm -q --qf '[%{FILESTATES} %{FILENAMES}\n]' "$1" | grep '^0 ' | cut -f2- -d ' '
+[ ${PIPESTATUS[0]} != 0 ] && echo "$1 not found" >/dev/stderr
+}
+
+# 
+# restore
+# if called with -n will only check file context
+#
+restore () {
+OPTION=$1
+shift
+
+if [ ! -z "$PREFC" ]; then
+    diff_filecontext $*
+    exit $?
+fi
+if [ ! -z "$RPMFILES" ]; then
+    for i in `echo "$RPMFILES" | sed 's/,/ /g'`; do
+	rpmlist $i | ${RESTORECON} ${FORCEFLAG} $* -R -i -f - 2>&1 | cat >> $LOGFILE
+    done
+    exit $?
+fi
+if [ ! -z "$FILEPATH" ]; then
+    ${RESTORECON} ${FORCEFLAG} -R $* $FILEPATH 2>&1 | cat >> $LOGFILE
+    return
+fi
+[ -x /usr/sbin/genhomedircon ] && /usr/sbin/genhomedircon
+#
+exclude_dirs="`exclude_dirs_from_relabelling`"
+if [ -n "${exclude_dirs}" ]
+then
+    TEMPFCFILE=`mktemp ${FC}.XXXXXXXXXX`
+    TEMPFCBACKUP=`mktemp ${FC}.XXXXXXXXXX.backup`
+    test -z "$TEMPFCFILE" && exit
+    /bin/cp -p ${FC} ${TEMPFCFILE} &>/dev/null || exit
+    /bin/cp -p ${FC} ${TEMPFCBACKUP} &>/dev/null || exit
+    tmpdirs=${tempdirs//-e/}
+    for p in ${tmpdirs}
+    do
+        p="${p%/}"
+        p1="${p}(/.*)? -- <<none>>"
+        echo "${p1}" >> $TEMPFCFILE
+        logit "skipping the directory ${p} from relabelling"
+    done
+/bin/cp $TEMPFCFILE $FC &>/dev/null || exit
+fi
+${SETFILES} $exclude_dirs -q ${SYSLOGFLAG} ${FORCEFLAG} $* ${FC} ${FILESYSTEMS} 2>&1 | cat >> $LOGFILE
+if [ ${OPTION} != "Relabel" ]; then
+    return
+fi
+if [ -n "${exclude_dirs}" ];then
+    /bin/cp -p ${TEMPFCBACKUP} ${FC} &>/dev/null || exit
+    rm -rf ${TEMPFCBACKUP}
+fi
+rm -rf /tmp/gconfd-* /tmp/pulse-* /tmp/orbit-* $TEMPFCFILE
+find /tmp \( -context "*:file_t*" -o -context "*:unlabeled_t*" \) -exec chcon -t tmp_t {} \;
+find /var/tmp \( -context "*:file_t*" -o -context "*:unlabeled_t*" \) -exec chcon -t tmp_t {} \;
+exit 0
+}
+
+fullrelabel() {
+    logit "Cleaning out /tmp"
+    find /tmp/ -mindepth 1 -delete
+    restore Relabel
+}
+
+relabel() {
+    if [ ! -z "$RPMFILES" ]; then
+	restore Relabel
+    fi
+
+    if [ $fullFlag == 1  ]; then
+	fullrelabel
+    fi
+
+    echo -n "
+    Files in the /tmp directory may be labeled incorrectly, this command 
+    can remove all files in /tmp.  If you choose to remove files from /tmp, 
+    a reboot will be required after completion.
+    
+    Do you wish to clean out the /tmp directory [N]? "
+    read answer
+    if [ "$answer" = y -o  "$answer" = Y ]; then 
+	fullrelabel
+    else
+	restore Relabel
+    fi
+}
+
+process() {
+#
+# Make sure they specified one of the three valid commands
+#
+case "$1" in
+    restore) restore Relabel -p ;;
+    check) restore Check -n -v;;
+    verify) restore Verify -n -o -;;
+    relabel) relabel;;
+    onboot)
+	touch /.autorelabel
+	echo "System will relabel on next boot"
+	;;
+    *)
+    usage
+    exit 1
+esac
+}
+usage() {
+      	echo $"""
+Usage: $0 [-F] [-l logfile ] { check | restore| [-f] relabel | verify } [[dir/file] ... ] 
+or
+Usage: $0 [-F] -R rpmpackage[,rpmpackage...] [-l logfile ] { check | restore | verify }
+or
+Usage: $0 [-F] -C PREVIOUS_FILECONTEXT { check | restore | verify }
+or
+Usage: $0 onboot
+"""
+}
+
+if [ $# = 0 ]; then
+	usage
+	exit 1
+fi
+
+# See how we were called.
+while getopts "C:FfR:l:" i; do
+    case "$i" in
+	f)
+		fullFlag=1
+		;;
+        R)
+		RPMFILES=$OPTARG
+		;;
+        l)
+		LOGFILE=$OPTARG
+		;;
+        C)
+		PREFC=$OPTARG
+		;;
+	F)
+		FORCEFLAG="-F"
+		;;
+	*)
+	    usage
+	    exit 1
+esac
+done
+
+# Move out processed options from arguments
+shift $(( OPTIND - 1 ))
+
+# Check for the command
+command=$1
+if [ -z $command ]; then
+    usage
+fi
+
+# Move out command from arguments
+shift
+
+#
+# check if they specified both DIRS and RPMFILES
+#
+
+if [ ! -z "$RPMFILES" ]; then
+    process $command
+    if [ $# -gt 0 ]; then
+	    usage
+    fi
+else
+    if [ -z "$1" ]; then
+	process $command
+    else
+	while [ -n "$1" ]; do 
+	    FILEPATH=$1
+	    process $command 
+	    shift
+    	done
+    fi
+fi
+exit $?

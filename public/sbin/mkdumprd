@@ -1,0 +1,4138 @@
+#!/bin/bash --norc
+# vim:sts=4:sw=4:ts=8:et
+
+# mkdumprd
+#
+# Copyright 2005 Red Hat, Inc.
+#
+# Written by Erik Troan <ewt@redhat.com>
+#
+# Contributors:
+#	Elliot Lee <sopwith@cuc.edu>
+#	Miguel de Icaza <miguel@nuclecu.unam.mx>
+#	Christian 'Dr. Disk' Hechelmann <drdisk@ds9.au.s.shuttle.de>
+#	Michael K. Johnson <johnsonm@redhat.com>
+#	Pierre Habraken <Pierre.Habraken@ujf-grenoble.fr>
+#	Jakub Jelinek <jakub@redhat.com>
+#	Carlo Arenas Belon (carenas@chasqui.lared.net.pe>
+#	Keith Owens <kaos@ocs.com.au>
+#	Bernhard Rosenkraenzer <bero@redhat.com>
+#	Matt Wilson <msw@redhat.com>
+#       Trond Eivind Glomsrød <teg@redhat.com>
+#       Jeremy Katz <katzj@redhat.com>
+#       Preston Brown <pbrown@redhat.com>
+#	Bill Nottingham <notting@redhat.com>
+#       Guillaume Cottenceau <gc@mandrakesoft.com>
+#	Peter Jones <pjones@redhat.com>
+#       Neil Horman <nhorman@redhat.com>
+#       Jarod Wilson <jwilson@redhat.com>
+#
+# Note: this scripts use 4 spaces as indent.
+cmdname=`basename $0`
+
+umask 0022
+
+export MALLOC_PERTURB_=204
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:$PATH
+export PATH
+
+. /etc/rc.d/init.d/functions
+
+VERSION=5.0.39
+
+PROBE="yes"
+MODULES=""
+PREMODS=""
+DMRAIDS=""
+MPATHS=""
+
+CLUSTER_CONFIG_FILE="/etc/cluster/cluster.conf"
+CLUSTER_NODE_LIST=""
+
+FENCE_KDUMP_CONFIG="/etc/sysconfig/fence_kdump"
+FENCE_KDUMP_OPTS=""
+
+CONFMODS="$MODULES"
+MODULES=""
+
+ARCH=$(uname -m)
+
+withusb=yes
+compress=1
+allowmissing=""
+target=""
+kernel=""
+force=""
+verbose=""
+img_vers=""
+builtins=""
+rc=0
+
+IMAGESIZE=8000
+PRESCSIMODS="sd_mod"
+fstab="/etc/fstab"
+
+vg_list=""
+net_list=""
+USING_METHOD=""
+SAVE_PATH=/var/crash
+bin=""
+KDUMP_POST=""
+extra_kdump_mods=""
+DUMP_TARGET=""
+DUMP_FSTYPE=""
+SSH_KEY_LOCATION="/root/.ssh/kdump_id_rsa"
+DMESG_COLLECTOR="/sbin/vmcore-dmesg"
+
+FONTDIR=/lib/kbd/consolefonts
+DEFAULT_FONT=LatArCyrHeb-16.psfu.gz
+
+override_resettable=0
+
+DISK_TIMEOUT=180
+DEBUG_MEM_LEVEL="0"
+
+FIPS_FILE="/proc/sys/crypto/fips_enabled"
+
+error()
+{
+    NONL=""
+    if [ "$1" == "-n" ]; then
+        NONL="-n"
+        shift
+    fi
+    echo $NONL "$@" >&2
+}
+
+cleanup_and_exit ()
+{
+    rm -rf $MNTIMAGE
+    rm -f $IMAGE
+    rm -f $TMPDISKLIST
+    exit $1
+}
+
+strip_comments() {
+    echo $@ | sed -e 's/\(.*\)#.*/\1/'
+}
+
+function make_trace_mem()
+{
+    # parameters: msg [trace_level:trace]...
+    msg=$1
+    shift
+    if [ "$DEBUG_MEM_LEVEL" -gt 0 ]; then
+        make_trace show_memstats $DEBUG_MEM_LEVEL "[debug_mem]" "$msg" "$@"
+    fi
+}
+
+function make_trace()
+{
+    # parameters: func log_level prefix msg [trace_level:trace]...
+    func=$1
+    shift
+
+    log_level=`echo "$1" | grep -o '^[0-9]\+'`
+    shift
+
+    prefix=$1
+    shift
+
+    msg=$1
+    shift
+
+    if [ -z "$log_level" ]; then
+        return
+    fi
+
+    # deal with indentation
+    space_at_front=`echo "$msg" | grep -o "^[[:space:]]\+"`
+    msg=`echo "$msg" | sed 's/^\s\+//'`
+
+    msg_printed=0
+    while [ $# -gt 0 ]; do
+        trace_level=`echo "$1" | grep -o '^[0-9]\+'`
+        trace_in_higher_levels=`echo "$1" | grep -o '+'`
+        trace=`echo $1 | sed "s/^.*://"`
+
+        if [ -z "$trace_level" ]; then
+            trace_level=0
+        fi
+
+        insert_trace=0
+        if [ -n "$trace_in_higher_levels" ]; then
+            if [ "$log_level" -ge "$trace_level" ]; then
+                insert_trace=1
+            fi
+        else
+            if [ "$log_level" -eq "$trace_level" ]; then
+                insert_trace=1
+            fi
+        fi
+
+        if [ $insert_trace -eq 1 ]; then
+            if [ $msg_printed -eq 0 ]; then
+                emit "${space_at_front}echo \"$prefix $msg\""
+                msg_printed=1
+            fi
+            emit "${space_at_front}$func $trace"
+        fi
+        shift
+    done
+}
+
+
+if [ -z "$TMPDIR" ]
+then
+    for t in /tmp /var/tmp /root ${PWD}; do
+        if [ ! -w $t ]; then continue; fi
+        TMPDIR=$t
+        break
+    done
+else
+    if [ ! -w "$TMPDIR" ]
+    then
+        error "Can't write to $TMPDIR."
+        exit 1
+    fi
+fi
+
+if [ -z "$TMPDIR" ]; then
+    error "No temporary directory could be found."
+    exit 1
+fi
+
+if [ $TMPDIR = "/root" -o $TMPDIR = "${PWD}" ]; then
+    error "WARNING: using $TMPDIR for temporary files"
+fi
+
+#for other commands below, like 'mount'
+export TMPDIR
+
+TMPDISKLIST=""
+MNTIMAGE=`mktemp -d ${TMPDIR}/initrd.XXXXXX`
+IMAGE=`mktemp ${TMPDIR}/initrd.img.XXXXXX`
+RCFILE=$MNTIMAGE/init
+
+vecho()
+{
+    NONL=""
+    if [ "$1" == "-n" ]; then
+        NONL="-n"
+        shift
+    fi
+    [ -n "$verbose" ] && echo $NONL "$@"
+}
+
+usage () {
+    if [ "$1" == "-n" ]; then
+        cmd=echo
+    else
+        cmd=error
+    fi
+
+    $cmd "usage: $cmdname [--version] [--help] [-v] [-d] [-f] [--preload <module>]"
+    $cmd "       [--image-version]"
+    $cmd "       [--builtin=<module>] [--omit-dmraid]"
+    $cmd "       [--fstab=<fstab>] [--nocompress] <initrd-image> <kernel-version>"
+    $cmd ""
+    $cmd "       (ex: $cmdname /boot/initrd-2.2.5-15.img 2.2.5-15)"
+
+    if [ "$1" == "-n" ]; then
+        exit 0
+    else
+        cleanup_and_exit 1
+    fi
+}
+
+moduledep() {
+    if [ ! -f "/lib/modules/$kernel/modules.dep" ]; then
+	error "No dep file found for kernel $kernel"
+	cleanup_and_exit 1
+    fi
+
+    deps=$(awk 'BEGIN { searched=ARGV[2]; ARGV[2]=""; rc=1 } \
+                function modname(filename) { match(filename, /\/([^\/]+)\.k?o:?$/, ret); return ret[1] } \
+                function show() { if (orig == searched) { print dep; orig=""; rc=0; exit } } \
+                /^\/lib/ { show(); \
+                           orig=modname($1); dep=""; \
+                           if ($2) { for (i = 2; i <= NF; i++) { dep=sprintf("%s %s", dep, modname($i)); } } } \
+                /^	/ { dep=sprintf("%s %s", dep, modname($1));  } \
+                END      { show(); exit(rc) }' /lib/modules/$kernel/modules.dep $1)
+    for i in `modprobe --set-version $kernel --show-depends $1 2>/dev/null | awk '/^insmod/ {print $2}'`
+    do
+       modname=`basename $i | sed -e's/\.ko//'`
+       if [ "$modname" == "$1" ]
+       then
+          continue
+       fi
+       deps="$deps $modname"
+    done
+    [ -n "$deps" ] && vecho ":$deps" || vecho
+}
+
+findone() {
+    find "$@" | /bin/awk '{print $1; exit}'
+}
+
+findall() {
+    find "$@"
+}
+
+find_dm_in_sysblock() {
+        local devnode=$1
+        local majmin
+        local device
+
+        [ ! -b "$devnode" ] && return 1;
+        majmin=$(get_numeric_dev dec $devnode)
+        [ -z "$majmin" ] && return 1
+        find -L /sys/block -maxdepth 2 -name dev | while read device ; do \
+                  echo "$majmin" | cmp -s $device && echo $device ; done \
+                  | sed -e 's,/dev$,,'
+}
+
+is_mpath() {
+    local major
+    local minor
+    local target
+
+    major=$(echo $1 | cut -d: -f1)
+    minor=$(echo $1 | cut -d: -f2)
+    for target in $(dmsetup -C -j $major -m $minor table 2>/dev/null | \
+            grep -v "No devices found" | awk ' { print $3 }') ; do
+        [ "$target" == "multipath" ] && return 0
+    done
+    return 1
+}
+
+find_mpath_deps() {
+    local devpath="/dev/$(echo $1 | sed -e 's,.*/\([^/]\+\),\1,' )"
+    local syspath="/sys/block/$(echo $1 | sed -e 's,.*/\([^/]\+\),\1,' )"
+    local arg2="$2"
+    local majmin=$(cat $syspath/dev)
+    local ret=1
+    if is_mpath ${majmin} ; then
+        arg2=yes
+    fi
+    slaves="$syspath/slaves/*"
+    for slave in $slaves ; do
+        [ -e $slave ] || continue
+        find_mpath_deps $(readlink $slave) ${arg2} && ret=0
+    done
+    if [ "$2" == "yes" ]; then
+        echo $devpath
+    fi
+    return $ret
+}
+
+dm_get_uuid() {
+    dmsetup info "$1" | awk '/^.*UUID.*/ {print $2}'
+}
+
+depsolve_modlist()
+{
+	local TMPINMODS=$MODULES
+	local TMPOUTMODS=""
+	local i
+	local j
+	local mname
+	local dpcnt
+	local scnt
+
+	#
+	# So, basically, we just do this until TMPINMODS
+	# is an empty list
+	#
+	while [ -n "$TMPINMODS" ]
+	do
+	   for i in $TMPINMODS
+	   do
+	      mname=`basename $i | sed -e's/\.ko//'`
+	      dpcnt=`modprobe --set-version $kernel --show-depends $mname 2>/dev/null | awk '/^insmod/ {print $2}' | wc -l`
+	      if [ $dpcnt -le 1 ]
+	      then
+	         # we have no dependencies, just add it to the list
+		 echo "$TMPOUTMODS" | grep -q $i
+		 if [ $? -ne 0 ]
+		 then
+			 TMPOUTMODS="$TMPOUTMODS $i"
+		 fi
+		 continue
+	      fi
+              # We should start this counter at 1, since we expect that the last
+              # line output by modprobe --show-depends will be the module we
+              # specify as mname below, but since modprobe is busted and
+              # sometimes doesn't do that, we start at zero, and increment an
+              # extra time below if we are searching for a dependency on ourself
+	      let scnt=0
+	      for j in `modprobe --set-version $kernel --show-depends $mname 2>/dev/null | awk '/^insmod/ {print $2}'`
+	      do
+		 echo $TMPOUTMODS | grep -q $j
+	         if [ $? -eq 0 ]
+	         then
+	            let scnt=$scnt+1
+	         fi
+                 # here we are looking to see if the insmod line is for the
+                 # module that we are searching for dependencies on.  We do this
+                 # because modprobe is busted in its show-depends line
+                 echo $j | grep -q $i
+                 if [ $? -eq  0 ]
+                 then
+                    let scnt=$scnt+1
+                 fi
+	      done
+	      if [ "$scnt" == "$dpcnt" ]
+	      then
+		 echo "$TMPOUTMODS" | grep -q $i
+		 if [ $? -ne 0 ]
+		 then
+			 TMPOUTMODS="$TMPOUTMODS $i"
+		 fi
+	      fi
+	   #Finish for i loop
+	   done
+	   for j in $TMPOUTMODS
+	   do
+	        TMPTMPMODS=""
+		for z in $TMPINMODS
+		do
+		   if [ "$j" == "$z" ]
+		   then
+			continue
+		   fi
+		   TMPTMPMODS="$TMPTMPMODS $z"
+		done
+		TMPINMODS=$TMPTMPMODS
+	   done
+	done
+	MODULES=$TMPOUTMODS
+}
+
+findmodule() {
+    local skiperrors=""
+    local mod_found=0
+
+    if [ $1 == "--skiperrors" ]; then
+        skiperrors=--skiperrors
+        shift
+    fi
+
+    local modName=$1
+    local skipdeps=$2
+
+    if [ "$modName" = "off" -o "$modName" = "null" ]; then
+        return
+    fi
+
+    if [ $(echo $modName | cut -b1) = "-" ]; then
+        skiperrors=--skiperrors
+        modName=$(echo $modName | cut -b2-)
+    fi
+
+    case "$MODULES " in
+        *"/$modName.ko "*) return ;;
+    esac
+
+    if echo $builtins | egrep -q '(^| )'$modName'( |$)' ; then
+        vecho "module $modName assumed to be built in"
+    return
+    fi
+
+    # special cases
+    case "$modName" in
+        raid[456])
+            modName=raid456
+            ;;
+    esac
+
+    if [ "$modName" = "i2o_block" ]; then
+        findmodule i2o_core
+        findmodule -i2o_pci
+        modName="i2o_block"
+    elif [ "$modName" = "ppa" ]; then
+        findmodule parport
+        findmodule parport_pc
+        modName="ppa"
+    elif [ "$modName" = "sbp2" ]; then
+        findmodule ieee1394
+        findmodule ohci1394
+        modName="sbp2"
+    else
+        if [ -z "$skipdeps" ]
+        then
+            moduledep $modName
+            for i in $deps; do
+                findmodule $i
+            done
+        fi
+    fi
+
+    fmPath=$(modprobe --set-version $kernel -l $modName 2>/dev/null)
+    if [ ! -f "/lib/modules/$kernel/$fmPath" ]; then
+        for modDir in /lib/modules/$kernel/updates /lib/modules/$kernel
+        do
+            if [ -d $modDir ]
+            then
+                fmPath=$(findone $modDir -name $modName.ko)
+                if [ -f "$fmPath" ]
+                then
+                    fmPath=${fmPath#/lib/modules/$kernel/}
+                    mod_found=1
+                    break
+                fi
+            fi
+        done
+    else
+        mod_found=1
+    fi
+
+    if [ $mod_found -eq 0 ]; then
+        if [ -n "$skiperrors" ]; then
+            return
+        fi
+
+        # ignore the absence of the scsi modules
+        for n in $PRESCSIMODS; do
+            if [ "$n" = "$modName" ]; then
+                return;
+            fi
+        done;
+
+        if [ -n "$allowmissing" ]; then
+            error "WARNING: No module $modName found for kernel $kernel, continuing anyway"
+            return
+        fi
+
+        error "No module $modName found for kernel $kernel, aborting."
+        cleanup_and_exit 1
+    fi
+
+    # only need to add each module once
+    MODULES="$MODULES /lib/modules/$kernel/$fmPath"
+
+    # need to handle prescsimods here -- they need to go _after_ scsi_mod
+    if [ "$modName" = "scsi_mod" ]; then
+        for n in $PRESCSIMODS ; do
+            findmodule $n
+        done
+    fi
+}
+
+find_scsi_dh_modules() {
+    local scsipath=$(modprobe --set-version $kernel --show-depends sg 2>/dev/null | awk '/^insmod / { print $2; }' | tail -1)
+    scsipath="${scsipath%%sg.ko}device_handler/"
+    [ -d "$scsipath" ] || return
+    for x in $scsipath/*.ko ; do
+        local h=${x##*/}
+        findmodule -${h%%.ko}
+    done
+}
+
+inst() {
+    if [ "$#" != "2" ];then
+        echo "usage: inst <file> <destination>"
+        return
+    fi
+    vecho "$1 -> $2"
+    cp $1 $2
+}
+
+handle_multipath () {
+    local sysdev
+    local deps
+    local device=$1
+
+    case " $multipath_devices " in
+        *" $device "*)
+            return ;;
+        *) multipath_devices="$multipath_devices $device" ;;
+    esac
+
+    findmodule -dm-mod
+    findmodule -dm-mirror
+    findmodule -dm-zero
+    findmodule -dm-snapshot
+
+    find_scsi_dh_modules
+    findmodule -dm-multipath
+    findmodule -dm-round-robin
+
+    sysdev=$(find_dm_in_sysblock /dev/$device)
+    deps=$(find_mpath_deps ${sysdev})
+
+    vecho -n "multipath components of $device are "
+    for dep in ${deps}; do
+        vecho -n "$dep "
+    done
+    vecho
+
+    for dep in ${deps}; do
+        findstoragedriver ${dep##/dev/}
+    done
+}
+
+resolve_dm() {
+    # resolve device mapper nodes to something of the form /dev/mapper/foo
+    if [[ ! "$1" =~ ^dm- ]]; then
+        echo $1
+        return 0
+    fi
+    majmin=$(cat /sys/block/$1/dev)
+    for dmdev in /dev/mapper/* ; do
+        dmnum=$(get_numeric_dev dec $dmdev)
+        if [ "$dmnum" = "$majmin" ]; then
+            echo ${dmdev#/dev/}
+            break
+        fi
+    done
+}
+
+handledm () {
+    local major=$1
+    local minor=$2
+    local origdevice=$3
+
+    # Check if it is a multipath device
+    if is_mpath "$major:$minor"; then
+        vecho "Found dm-multipath component $origdevice"
+        handle_multipath ${origdevice}
+        return 0;
+    fi
+
+    while read dmstart dmend dmtype r0 r1 r2 r3 r4 r5 r6 r7 r8 r9 ; do
+        case "$dmtype" in
+            linear)
+                slavedev=$(find -L /sys/block -maxdepth 2 -name dev \
+                           | while read device ; do \
+                                echo "$r0" \
+                                    | cmp -s $device && echo $device ; \
+                             done \
+                           | sed -e 's,.*/\([^/]\+\)/dev,\1,;s,!,/,' )
+                slavedev=$(resolve_dm ${slavedev##/dev/})
+                vecho "$device device is linear, slave is $slavedev"
+                handlelvordev "/dev/$slavedev"
+                ;;
+        esac
+    done << EOF
+        $(dmsetup table -j $major -m $minor 2>/dev/null)
+EOF
+}
+
+findstoragedriverinsys () {
+    while [ ! -L device ]; do
+        [ "$PWD" = "/sys" ] && return
+        cd ..
+    done
+    cd $(readlink ./device)
+    if is_iscsi $PWD; then
+        handleiscsi "$PWD"
+    fi
+    while [ ! -f modalias ]; do
+        [ "$PWD" = "/sys/devices" ] && return
+        cd ..
+    done
+    modalias=$(cat modalias)
+    for driver in $(modprobe --set-version $kernel --show-depends $modalias 2>/dev/null| awk '/^insmod/ { print gensub(".*/","","g",$2) }') ; do
+        findmodule ${driver%%.ko}
+    done
+}
+
+get_basedev() {
+    echo $1 | sed -e's/\/dev\///' -e's/[0-9]\+$//'
+}
+
+identify_critical_disk_by_vendor_model_type() {
+    local i
+    local a
+    local TMPNAME
+    local DSKSTRING
+    local found
+    local IDSTRING
+    local basedev=$1
+
+    [ -z "$TMPDISKLIST" ]  && TMPDISKLIST=`mktemp ${TMPDIR}/disklist.XXXXXX`
+    if [ -d /sys/block/$basedev ]
+    then
+        TMPNAME=""
+        DSKSTRING=""
+        #only add devices which have a presence in sysfs
+        for i in "vendor" "model" "type"
+        do
+            TMPNAME=`cat /sys/block/$basedev/device/$i 2>/dev/null`
+            DSKSTRING="$DSKSTRING $TMPNAME"
+        done
+        DSKSTRING=$(echo $DSKSTRING | sed -e's/ //g')
+        if grep -q "$DSKSTRING" "$TMPDISKLIST"
+        then
+            found=`awk '{ if($2 == "'"$DSKSTRING"'") print $3; }' $TMPDISKLIST`
+            echo -n "$basedev $DSKSTRING" > $TMPDISKLIST
+        else
+            found=0
+            echo -n "$basedev $DSKSTRING" >> $TMPDISKLIST
+        fi
+
+        for i in `ls /sys/block`
+        do
+            IDSTRING=""
+            if [ ! -d /sys/block/$i/device ]
+            then
+                continue
+            fi
+            for a in "vendor" "model" "type"
+            do
+                TMPNAME=`cat /sys/block/$i/device/$a 2>/dev/null`
+                IDSTRING="$IDSTRING $TMPNAME"
+            done
+            IDSTRING=$(echo $IDSTRING | sed -e's/ //g')
+            if [ "$DSKSTRING" == "$IDSTRING" ]
+            then
+                found=$(($found + 1))
+            fi
+        done
+
+        echo " $found">>$TMPDISKLIST
+    fi
+}
+
+identify_critical_disk_by_scsi_id() {
+    local scsi_id=""
+    scsi_id=$(/lib/udev/scsi_id --whitelisted --device=/dev/$1 --replace-whitespace)
+    if ! grep -q "$scsi_id" $MNTIMAGE/etc/critical_scsi_ids 2>/dev/null; then
+        echo "$scsi_id" >> $MNTIMAGE/etc/critical_scsi_ids
+    fi
+}
+
+is_virtio_disk_with_serial() {
+    [[ $(readlink /sys/block/$1) =~ virtio ]] && \
+        [ -n "$(cat /sys/block/$1/serial 2>/dev/null)" ]
+}
+
+identify_critical_disk_by_virtio_serial() {
+    local serial
+
+    serial=$(cat /sys/block/$1/serial 2>/dev/null)
+
+    if ! grep -q "$serial" $MNTIMAGE/etc/virtio_ids 2>/dev/null; then
+        echo "$serial" >> $MNTIMAGE/etc/virtio_ids
+    fi
+}
+
+# Check for a Storage Class Memory (SCM) device (s390 only).
+is_scm() {
+    # /sys/block/scma -> ../devices/scm/0000000000000000/block/scma
+    if [[ $(readlink /sys/block/$1) =~ /scm/[0-9a-f][0-9a-f]*/ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+identify_critical_disk_by_scmid() {
+    local scm_id
+
+    # /sys/block/scma/device -> ../../../0000000000000000/
+    scm_id=$(basename $(readlink /sys/block/$1/device))
+
+    if ! grep -q "$scm_id" $MNTIMAGE/etc/scm_ids 2>/dev/null; then
+        echo "$scm_id" >> $MNTIMAGE/etc/scm_ids
+    fi
+}
+
+# Check for DASD device (s390 only)
+is_dasd() {
+    # /sys/block/dasda -> ../devices/css0/0.0.000c/0.0.23b5/block/dasda
+    if [[ $1 =~ dasd ]] && [[ $(readlink /sys/block/$1) =~ /css.*/ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+identify_critical_disk_by_dasd_bus_id() {
+    local dasd_bus_id
+
+    dasd_bus_id=$(basename $(readlink /sys/block/$1/device))
+
+    if ! grep -q "$dasd_bus_id" $MNTIMAGE/etc/dasd_bus_ids 2>/dev/null; then
+        echo "$dasd_bus_id" >> $MNTIMAGE/etc/dasd_bus_ids
+    fi
+}
+
+#$1: device name: /dev/devname
+#other logic to find critical disks should go to this function
+identify_critical_disk() {
+    local basedev=$(get_basedev $1)
+    local scsiid
+
+    # don't block on cciss devices, parsing them in sysfs takes a special
+    # case and there might be some other old reason for this which are not
+    # clear.  Also don't block on md/dm devices because we only need waiting
+    # for their children devices, and md/dm devices will be setup in later code.
+    if echo $basedev|egrep -s -q '(^cciss|^md|^dm|^mapper\/)'; then
+        return
+    fi
+
+    scsiid=$(/lib/udev/scsi_id --whitelisted /dev/$basedev --replace-whitespace)
+    #do not use scsi_id for qemu ide disks because the ids are not persistent.
+    if [ -n "$scsiid" ] && [ "$scsiid" = "${scsiid/QEMU_HARDDISK/}" ]; then
+        identify_critical_disk_by_scsi_id $basedev
+    elif is_virtio_disk_with_serial $basedev; then
+        identify_critical_disk_by_virtio_serial $basedev
+    elif is_scm $basedev; then
+        identify_critical_disk_by_scmid $basedev
+    elif is_dasd $basedev; then
+        identify_critical_disk_by_dasd_bus_id $basedev
+    else
+        identify_critical_disk_by_vendor_model_type $basedev
+    fi
+}
+
+findstoragedriver () {
+    local majmin
+    local device
+    local sysfs
+
+    for device in $@ ; do
+        identify_critical_disk $device
+        case " $handleddevices " in
+            *" $device "*)
+                continue ;;
+            *) handleddevices="$handleddevices $device" ;;
+        esac
+        echo $device | grep -q "md[0-9]\+"
+        if [ $? == 0 ]; then
+            vecho "Found RAID component $device"
+            handleraid "$device"
+            continue
+        fi
+
+        if [[ "$device" =~ ^(dm-|mapper/|mpath/) ]]; then
+            device=$(resolve_dm $device)
+            vecho "Found DM device $device"
+            majmin=$(get_numeric_dev dec "/dev/$device")
+            sysfs=$(find_dm_in_sysblock /dev/$device)
+            handledm $(echo "$majmin" |cut -d : -f 1) $(echo "$majmin" |cut -d : -f 2) ${device}
+            continue;
+        fi
+
+        device=`echo $device | sed 's/\//\!/g'`
+        sysfs=$(findone -L /sys/block -maxdepth 2 -type d -name $device)
+        [ -z "$sysfs" ] && return
+        pushd $sysfs >/dev/null 2>&1
+        findstoragedriverinsys
+        popd >/dev/null 2>&1
+    done
+}
+
+kdump_is_bridge() {
+     [ -d /sys/class/net/"$1"/bridge ]
+}
+
+kdump_is_bond() {
+     [ -d /sys/class/net/"$1"/bonding ]
+}
+kdump_is_vlan() {
+     [ -f /proc/net/vlan/"$1" ]
+}
+
+findnetdriver() {
+    for device in $@ ; do
+        case " $handleddevices " in
+            *" $device "*)
+                continue ;;
+            *) handleddevices="$handleddevices $device" ;;
+        esac
+
+        if kdump_is_vlan "$device"; then
+            modalias=8021q
+        elif kdump_is_bond "$device"; then
+            modalias=bonding
+        elif kdump_is_bridge "$device"; then
+            modalias=bridge
+        elif [ -f /sys/class/net/$device/device/modalias ]; then
+            modalias=$(cat /sys/class/net/$device/device/modalias)
+        else
+            modalias=$(ethtool -i $device | awk '/^driver:/ { print $2 }')
+        fi
+        for driver in $(modprobe --set-version $kernel --show-depends $modalias 2>/dev/null| awk '/^insmod/ { print gensub(".*/","","g",$2) }') ; do
+            if [ "$driver" = "mlx4_core.ko" ]; then
+                extra_kdump_mods="$extra_kdump_mods mlx4_core"
+            fi
+            findmodule ${driver%%.ko}
+        done
+    done
+}
+
+iscsi_get_rec_val() {
+
+    # The open-iscsi 742 release changed to using flat files in
+    # /var/lib/iscsi.
+
+    result=$(/sbin/iscsiadm --show -m session -r ${1} | grep "^${2} = ")
+    result=${result##* = }
+}
+
+# No ibft handling yet.
+iscsi_set_parameters() {
+    path=$1
+    vecho "setting iscsi parameters"
+
+    # Check once before getting explicit values, so we can output a decent
+    # error message.
+
+    if ! /sbin/iscsiadm -m session -r ${path} >/dev/null ; then
+        echo "Unable to find iscsi record for $path"
+        exit 1
+    fi
+
+    iscsi_get_rec_val $path "node.name"; tgt_name=${result}
+    iscsi_get_rec_val $path "node.conn\[0\].address"; tgt_ipaddr=${result}
+}
+
+is_iscsi() {
+    path=$1
+    if echo $path | grep -q "/platform/host[0-9]*/session[0-9]*/target[0-9]*:[0-9]*:[0-9]*/[0-9]*:[0-9]*:[0-9]*:[0-9]*"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Taken from mkinitrd. Trimmed for bare minimum functionality.
+handleiscsi() {
+    vecho "Found iscsi component $1"
+
+    for idev in $ISCSI_DEVICES; do
+        # try to avoid any duplication of a target
+        if [ "${idev%/*}" == "${1%/*}" ]; then
+            vecho "Already have ${1%/*}... skipping."
+            return
+        fi
+    done
+
+    findmodule iscsi_tcp
+    findmodule sd_mod
+
+    iscsi_set_parameters $1
+    netdev=$(/sbin/ip route get to $tgt_ipaddr | \
+        sed 's|.*dev \(.*\).*|\1|g' | awk '{ print $1; exit }')
+
+    mkdir -p $MNTIMAGE/etc/network/
+    handlenetdev $netdev
+    echo $netdev >> $MNTIMAGE/etc/iface_to_activate
+
+    ISCSI_DEVICES="$ISCSI_DEVICES $1"
+    vecho "iscsi component target is $tgt_name"
+    ISCSI_TARGETS="$ISCSI_TARGETS $tgt_name"
+}
+
+handleraid() {
+    local start=0
+
+    if [ -n "$noraid" -o ! -f /proc/mdstat ]; then
+        return 0
+    fi
+
+    levels=$(grep "^$1[	 ]*:" /proc/mdstat | \
+        awk '{ print $4 }')
+    devs=$(grep "^$1[	 ]*:" /proc/mdstat | \
+        awk '{ print gensub("\\[[0-9]*\\]","","g",gensub("^md.*raid[0-9]*","","1")) }')
+
+    for level in $levels ; do
+	case $level in
+	linear)
+	    findmodule linear
+	    start=1
+	    ;;
+	multipath)
+	    findmodule multipath
+	    start=1
+	    ;;
+	raid[01456] | raid10)
+	    findmodule $level
+	    start=1
+	    ;;
+	*)
+	    error "raid level $level (in /proc/mdstat) not recognized"
+	    ;;
+	esac
+    done
+    findstoragedriver $devs
+    if [ "$start" = 1 ]; then
+        raiddevices="$raiddevices $1"
+    fi
+    return $start
+}
+
+check_encrypted() {
+    [ -f /etc/crypttab ] || return 0
+    local dev=$1
+    if lsblk -d -n -o TYPE "$dev" 2>/dev/null | grep -q crypt;
+    then
+        error "Device $dev is encrypted, can not be used in kdump"
+        cleanup_and_exit 1
+    fi
+    return 0
+}
+
+check_resettable() {
+    local path="/sys/$(udevadm info --query=all --name="$1" | awk '/^P:/ {print $2}' | sed -e 's/\(cciss[0-9]\+\/\).*/\1/g' -e 's/\/block\/.*$//')/resettable"
+    local resettable=1
+    if [ ! -f "$path" ]
+    then
+        return
+    else
+        resettable="$(cat $path)"
+    fi
+    if [ $resettable -eq 0 ]
+    then
+        if [ "$2" -eq 0 ]
+        then
+            error "Can not save vmcore to target device $1. This device can not be initialized in kdump kernel as it is not resettable"
+        else
+            error "Rootfs device $1 is not resettable, can not be used as the default target, please specify a default action"
+        fi
+        if [ "$override_resettable" -eq 0 ]
+        then
+            cleanup_and_exit 1
+        fi
+    fi
+}
+
+get_devname_from_uuid_label() {
+    local device="$1"
+    local IS_UUID IS_LABEL
+
+    IS_UUID=$(echo $device | grep UUID)
+    IS_LABEL=$(echo $device | grep LABEL)
+    if [ -n "$IS_UUID" -o -n "$IS_LABEL" ]; then
+        device=$(findfs $device)
+        if [ $? -ne 0 ]; then
+            echo "find device name failed for $device"
+            cleanup_and_exit 1
+        fi
+    fi
+
+    echo $device
+}
+
+handlelvordev() {
+    local dev=$(get_devname_from_uuid_label $1)
+
+    check_encrypted "$dev"
+    local vg=`lvs --noheadings -o vg_name $dev 2>/dev/null`
+    if [ -z "$vg" ]; then
+        vg=`lvs --noheadings -o vg_name $(echo $dev | sed -e 's#^/dev/mapper/\([^-]*\)-\(.*\)$#/dev/\1/\2#') 2>/dev/null`
+    fi
+    if [ -n "$vg" ]; then
+        vg=`echo $vg` # strip whitespace
+        case " $vg_list " in
+        *" $vg "*)
+            ;;
+        *)
+            vg_list="$vg_list $vg"
+            for device in `vgdisplay -v $vg 2>/dev/null | sed -n 's/PV Name//p'`; do
+                check_resettable "$device" "$2"
+                check_encrypted "$device"
+                findstoragedriver ${device##/dev/}
+            done
+            ;;
+        esac
+    else
+        check_resettable "$dev" "$2"
+        findstoragedriver ${dev##/dev/}
+    fi
+}
+
+get_routes() {
+    local dev="$1"
+    local routes=`/sbin/ip route show | grep "^[[:digit:]].*via.* $dev "`
+
+    if [ -z "$GATEWAY" ]
+    then
+        GATEWAY=`/sbin/ip route show | awk '/^default/ {print $3}'`
+    fi
+    if [ -n "$GATEWAY" ]
+    then
+        echo "  " gateway $GATEWAY >> $MNTIMAGE/etc/network/interfaces
+    fi
+
+    if [ -n "$routes" ]
+    then
+        /sbin/ip route show | grep "^[[:digit:]].*via.* $dev " \
+                >>  $MNTIMAGE/etc/network/route-static
+    fi
+}
+
+find_ifcfg_by_devicename() {
+    local dev=$1
+
+    if [ -f /etc/sysconfig/network-scripts/ifcfg-$dev ]
+    then
+        echo /etc/sysconfig/network-scripts/ifcfg-$dev
+        return
+    fi
+
+    for file in `ls /etc/sysconfig/network-scripts/ifcfg-*`
+    do
+        if grep -q -E  "^[^#]*(DEVICE|device).*$dev" $file
+        then
+            echo $file
+            return
+        fi
+    done
+}
+
+handlenetdev() {
+    local dev=$1
+    local ifcfg_file
+
+    case " $handlednetdevices " in
+        *" $dev "*)
+            return ;;
+        *) handlednetdevices="$handlednetdevices $dev" ;;
+    esac
+
+    ifcfg_file=`find_ifcfg_by_devicename $dev`
+    if [ -z "${ifcfg_file}" ]; then
+        error "The ifcfg-$dev or ifcfg-xxx which contains DEVICE=$dev field doesn't exist."
+        cleanup_and_exit 1
+    fi
+    cp ${ifcfg_file} $MNTIMAGE/etc/ifcfg-$dev
+
+    BOOTPROTO=""
+    VLAN=""
+    MASTER=""
+    SLAVE=""
+    IPADDR=""
+    . $MNTIMAGE/etc/ifcfg-$dev
+
+    findnetdriver $dev
+
+    if [ "$BOOTPROTO" == "dhcp" ]
+    then
+        if ! grep -q "iface $dev inet dhcp" $MNTIMAGE/etc/network/interfaces 2>/dev/null
+        then
+            echo "iface $dev inet dhcp" >> $MNTIMAGE/etc/network/interfaces
+        fi
+    elif [ -n "$IPADDR" ]
+    then
+        if ! grep -q "iface $dev inet static" $MNTIMAGE/etc/network/interfaces 2>/dev/null
+        then
+            echo "iface $dev inet static" >> $MNTIMAGE/etc/network/interfaces
+        fi
+        echo "  " address $IPADDR >> $MNTIMAGE/etc/network/interfaces
+        if [ -n "$NETMASK" ] && [ -n "$PREFIX" ]
+        then
+            echo "Warning: both NETMASK and PREFIX exist, mkdumprd is confused"
+        fi
+        if [ -n "$NETMASK" ]
+        then
+            echo "  " netmask $NETMASK >> $MNTIMAGE/etc/network/interfaces
+        elif [ -n "$PREFIX" ]
+        then
+            echo "  " netmask $(ipcalc -m 127.0.0.1/$PREFIX | cut -d'=' -f2) >> $MNTIMAGE/etc/network/interfaces
+            sed -i -e "s/PREFIX=.*/NETMASK=$(ipcalc -m 127.0.0.1/$PREFIX | cut -d'=' -f2)/" $MNTIMAGE/etc/ifcfg-$dev
+        fi
+	get_routes $dev
+        cp -a /etc/resolv.conf $MNTIMAGE/etc
+    else
+        echo iface $dev inet static >> $MNTIMAGE/etc/network/interfaces
+        echo "  " address 0.0.0.0 >> $MNTIMAGE/etc/network/interfaces
+        echo "  " netmask 0.0.0.0 >> $MNTIMAGE/etc/network/interfaces
+        echo "  " bnmask 0 >> $MNTIMAGE/etc/network/interfaces
+    fi
+
+    #This lets us recursively handle stacked devices
+    if kdump_is_vlan "$dev"
+    then
+        if [ "$VLAN" == "yes" ]
+        then
+            echo >> $MNTIMAGE/etc/ifcfg-$dev
+            echo "BUS_ID=\"Vlan\"" >> $MNTIMAGE/etc/ifcfg-$dev
+            BASE_IFC=`awk '/^Device:/ {print $2}' /proc/net/vlan/$dev`
+            handlenetdev $BASE_IFC
+        fi
+    elif kdump_is_bond "$dev"
+    then
+        #This is a bond, pick up its slaves
+        for j in `cat /sys/class/net/$dev/bonding/slaves`
+        do
+            handlenetdev $j
+        done
+        echo >> $MNTIMAGE/etc/ifcfg-$dev
+        echo "BUS_ID=\"Bonding\"" >> $MNTIMAGE/etc/ifcfg-$dev
+    elif kdump_is_bridge "$dev"
+    then
+        for j in `ls /sys/class/net/$dev/brif`
+        do
+            handlenetdev $j
+        done
+        echo >> $MNTIMAGE/etc/ifcfg-$dev
+        echo "BUS_ID=\"Bridge\"" >> $MNTIMAGE/etc/ifcfg-$dev
+    else
+        if [ "$VLAN" == "yes" ]
+        then
+            echo >> $MNTIMAGE/etc/ifcfg-$dev
+            echo "BUS_ID=\"Vlan\"" >> $MNTIMAGE/etc/ifcfg-$dev
+            BASE_IFC=`awk '/^Device:/ {print $2}' /proc/net/vlan/$dev`
+            handlenetdev $BASE_IFC
+        else
+            BUS_ID=`ls -l /sys/class/net/$dev/device | sed -e's/\(.*\/\)\(.*$\)/\2/'`
+            echo >> $MNTIMAGE/etc/ifcfg-$dev
+            echo "BUS_ID=\"$BUS_ID\"" >> $MNTIMAGE/etc/ifcfg-$dev
+        fi
+    fi
+}
+
+arch_netdev_init() {
+    if [ "$ARCH" = "s390x" ]; then
+        if [ -e /sys/bus/ccw ]; then
+            install_ccw_net_init
+            emit "for i in \`ls /etc/ifcfg-* 2>/dev/null\`; do"
+            emit "       ccw_net_init \$i"
+            emit "done"
+        else
+            error "/sys/bus/ccw is required to set up net devices"
+            cleanup_and_exit 1
+        fi
+    fi
+}
+
+while [ $# -gt 0 ]; do
+    case $1 in
+	--fstab*)
+	    if echo $1 | grep -q '=' ; then
+	    	fstab=`echo $1 | sed 's/^--fstab=//'`
+	    else
+		fstab=$2
+		shift
+	    fi
+	    ;;
+
+	--with-usb)
+	    withusb=yes
+	    ;;
+
+        --without-usb)
+            withusb=no
+            ;;
+
+	--with*)
+	    if echo $1 | grep -q '=' ; then
+	    	modname=`echo $1 | sed 's/^--with=//'`
+	    else
+		modname=$2
+		shift
+	    fi
+
+	    basicmodules="$basicmodules $modname"
+	    ;;
+
+	--builtin*)
+	    if echo $1 | grep -q '=' ; then
+	    	modname=`echo $1 | sed 's/^--builtin=//'`
+	    else
+		modname=$2
+		shift
+	    fi
+	    builtins="$builtins $modname"
+	    ;;
+
+	--version)
+	    echo "$cmdname: version $VERSION"
+	    exit 0
+	    ;;
+
+	-v)
+	    verbose=-v
+	    ;;
+
+	--nocompress)
+	    compress=""
+	    ;;
+
+	--ifneeded)
+	    # legacy
+	    ;;
+
+	-f)
+	    force=1
+	    ;;
+    
+        -d)
+            KDUMP_CONFIG_FILE=""
+            if [ -f /etc/kdump.conf ]; then
+                KDUMP_CONFIG_FILE="/etc/kdump.conf"
+            fi
+            ;;
+
+	--preload*)
+	    if echo $1 | grep -q '=' ; then
+	    	modname=`echo $1 | sed 's/^--preload=//'`
+	    else
+		modname=$2
+		shift
+	    fi
+	    PREMODS="$PREMODS $modname"
+	    ;;
+	--force-scsi-probe)
+	    forcescsi=1
+	    ;;
+	--omit-scsi-modules)
+	    PRESCSIMODS=""
+	    noscsi=1
+	    ;;
+	--force-raid-probe)
+	    forceraid=1
+	    ;;
+	--omit-raid-modules)
+	    noraid=1
+	    ;;
+	--force-lvm-probe)
+	    forcelvm=1
+	    ;;
+	--omit-lvm-modules)
+	    nolvm=1
+	    ;;
+	--omit-dmraid)
+	    nodmraid=1
+            ;;
+        --force-ide-probe)
+            forceide=1
+            ;;
+	--image-version)
+	    img_vers=yes
+	    ;;
+	--allow-missing)
+	    allowmissing=yes
+	    ;;
+	--noresume)
+	    noresume=1
+	    ;;
+        --override-resettable)
+            override_resettable=1
+            ;;
+        --help)
+            usage -n
+            ;;
+	*)
+	    if [ -z "$target" ]; then
+		target=$1
+	    elif [ -z "$kernel" ]; then
+		kernel=$1
+	    else
+		usage
+	    fi
+	    ;;
+    esac
+
+    shift
+done
+
+if [ -z "$target" -o -z "$kernel" ]; then
+    usage
+fi
+
+if [ -n "$img_vers" ]; then
+    target="$target-$kernel"
+fi
+
+if [ -z "$force" -a -f $target ]; then
+    error "$target already exists."
+    cleanup_and_exit 1
+fi
+
+if [ -n "$forcescsi" -a -n "$noscsi" ]; then
+    error "Can't both force scsi probe and omit scsi modules"
+    cleanup_and_exit 1
+fi
+
+if [ -n "$forceraid" -a -n "$noraid" ]; then
+    error "Can't both force raid probe and omit raid modules"
+    cleanup_and_exit 1
+fi
+
+if [ -n "$forcelvm" -a -n "$nolvm" ]; then
+    error "Can't both force LVM probe and omit LVM modules"
+    cleanup_and_exit 1
+fi
+
+if [ ! -d /lib/modules/$kernel ]; then
+    error 'No modules available for kernel "'${kernel}'".'
+    cleanup_and_exit 1
+fi
+
+if [ $UID != 0 ]; then
+    error "$cmdname must be run as root."
+    cleanup_and_exit 1
+fi
+
+vecho "Creating initramfs"
+modulefile=/etc/modprobe.conf
+if [ ! -f $modulefile ] ;then
+    if [ -d /etc/modprobe.d -a -n "$(ls -A /etc/modprobe.d)" ] ; then
+        modulefile="$(echo /etc/modprobe.d/*.conf)"
+    else
+        modulefile=""
+    fi
+fi
+
+for n in $PREMODS; do
+	findmodule $n
+done
+
+[ ! -d $MNTIMAGE/var/lib ] && mkdir -p $MNTIMAGE/var/lib
+inst /var/lib/random-seed $MNTIMAGE/var/lib/random-seed 2>/dev/null || {
+    error "Saving random seed failed."
+    cleanup_and_exit 1
+}
+
+needusb=""
+if [ -n "$withusb" -a "x$PROBE" == "xyes" ]; then
+    # If / or /boot is on a USB device include the driver. With root by
+    # label we could still get some odd behaviors
+    for fs in / /boot ; do
+        esc=$(echo $fs | sed 's,/,\\/,g')
+        dev=$(mount | awk "/ on ${esc} / { print \$1 }" | sed 's/[0-9]*$//' | cut -d/ -f3)
+        if [ "$(echo $dev | cut -c1-2)" = sd ]; then
+            if [ `which kudzu 2>/dev/null` ]; then
+                host=$(kudzu --probe -b scsi |
+                gawk '/^device: '${dev}'/,/^host:/ { if (/^host/) { print $2; exit; } }')
+                if [ -d /proc/scsi/usb-storage-${host} -o -f /proc/scsi/usb-storage/${host} ]; then
+                    needusb=1
+                fi
+            fi
+        fi
+    done
+fi
+
+# for USB keyboard
+if [ -z "$needusb" -a -n "$withusb" -a "x$PROBE" == "xyes" ];
+then
+    for inputdev in $(ls -d /sys/class/input/input* 2>/dev/null); do
+        if [ ! -e ${inputdev}/mouse* ]; then
+            if  [ "$(cat ${inputdev}/phys | cut -c1-3)" = usb ]; then
+                needusb=1
+            fi
+        fi
+    done
+fi
+
+if [ -n "$needusb" -a "x$PROBE" == "xyes" -a -n "$modulefile" ]; then
+    drivers=$(awk '/^alias[[:space:]]+usb-controller[0-9]* / { print $3}' $modulefile)
+    useUSB=0
+    if [ -n "$drivers" ]; then
+        useUSB=1
+        for driver in $drivers; do
+            findmodule $driver
+        done
+    fi
+    for x in $(awk '/^[eou]hci_hcd/ {print $1}' /proc/modules | sed '1!G;h;$!d') ; do
+        useUSB=1
+        findmodule $(echo $x | sed 's/_/-/')
+    done
+    if [ "$useUSB" == "1" ]; then
+        findmodule scsi_mod
+        findmodule sd_mod
+    fi
+fi
+
+if [ -n "$forcescsi" -o -z "$noscsi" -a "x$PROBE" == "xyes" ]; then
+    if [ -n "$modulefile" ]; then
+	scsimodules=`grep "alias[[:space:]]\+scsi_hostadapter" $modulefile | grep -v '^[ 	]*#' | LC_ALL=C sort -u | awk '{ print $3 }'`
+
+	if [ -n "$scsimodules" ]; then
+            for n in $scsimodules; do
+    # for now allow scsi modules to come from anywhere.  There are some
+    # RAID controllers with drivers in block/
+		findmodule $n
+	    done
+	fi
+    fi
+fi
+
+# If we have ide devices and module ide, do the right thing
+ide=/proc/ide/ide*
+if [ -n "$forceide" -o -n "$ide" -a "x$PROBE" == "xyes" ]; then
+    findmodule -ide-disk
+fi
+
+# If we have dasd devices, include the necessary modules (S/390)
+if [ "x$PROBE" == "xyes" -a -d /proc/dasd ]; then
+    findmodule -dasd_mod
+    findmodule -dasd_eckd_mod
+    findmodule -dasd_fba_mod
+fi
+
+add_rootfs()
+{
+if [ "x$PROBE" == "xyes" ]; then
+    rootfs=$(awk '{ if ($1 !~ /^[ \t]*#/ && $2 == "/") { print $3; }}' $fstab)
+    rootopts=$(awk '{ if ($1 !~ /^[ \t]*#/ && $2 == "/") { print $4; }}' $fstab)
+
+    # in case the root filesystem is modular
+    findmodule -${rootfs}
+
+    rootdev=$(awk '/^[ \t]*[^#]/ { if ($2 == "/") { print $1; }}' $fstab)
+    # check if it's nfsroot
+    if [ "$rootfs" == "nfs" ]; then
+	remote=$(echo $rootdev | cut -d : -f 1)
+	# FIXME: this doesn't handle ips properly
+	remoteip=$(getent ahostsv4 $remote | head -n 1 | cut -d ' ' -f 1)
+	netdev=`/sbin/ip route get to $remoteip |sed 's|.*dev \(.*\).*|\1|g' |awk {'print $1;'} |head -n 1`	
+	net_list="$net_list $netdev"
+    # check if it's root by label
+    elif echo  $rootdev | cut -c1-6 | grep -q "UUID=\|LABEL=" ; then
+        dev=`/sbin/findfs $rootdev`
+        if [ -n "$dev" ] ; then 
+            vecho "Found root device $dev for $rootdev"
+            rootdev=$dev
+        fi
+    else
+    	rootopts=$(echo $rootopts | sed -e 's/^r[ow],//' -e 's/,r[ow],$//' -e 's/,r[ow],/,/' \
+                     -e 's/^r[ow]$/defaults/' -e 's/$/,ro/')
+    fi
+    [ "$rootfs" != "nfs" ] && handlelvordev $rootdev 1
+fi
+}
+
+# If we use LVM or dm-based raid, include dm-mod
+# XXX: dm not really supported yet.
+testdm=""
+[ -n "$vg_list" ] && testdm="yes"
+[ -n "$forceraid" -o -n "$forcelvm" ] && testdm="yes"
+[ -z "$nolvm" -o -z "$noraid" ] && testdm="yes"
+[ "x$PROBE" != "xyes" ] && testdm=""
+
+if [ -n "$testdm" ]; then
+    if [ -x /sbin/dmsetup -a -e /dev/mapper/control ]; then
+	dmout=$(/sbin/dmsetup ls 2>/dev/null)
+	if [ "$dmout" != "No devices found" -a "$dmout" != "" ]; then
+	    findmodule -dm-mod
+
+            # DM requires all of these to be there in case someone used the
+            # feature.  broken.  (#132001)
+            findmodule -dm-mirror
+            findmodule -dm-zero
+            findmodule -dm-snapshot
+	fi
+    fi
+    if [ -x /sbin/dmraid -a -z "$nodmraid" ]; then
+        NOBLK=`/sbin/dmraid -s -craidname 2>/dev/null | grep  "no block devices"`
+        NORAD=`/sbin/dmraid -s -craidname 2>/dev/null | grep  "no raid disks"`
+        if [ -z "$NOBLK" ] && [ -z "$NORAD" ]
+        then
+            for raid in $(/sbin/dmraid -s -craidname 2>/dev/null) ; do
+                DMRAIDS="$DMRAIDS $raid"
+            done
+        fi
+    fi
+fi
+
+if [ "$useUSB" == "1" ]; then
+    findmodule usb-storage
+fi
+
+for n in $basicmodules; do
+    findmodule $n
+done
+
+for n in $CONFMODS; do
+    findmodule $n
+done
+
+vecho "Using modules:$MODULES"
+
+cemit()
+{
+    cat >> $RCFILE
+}
+
+emit()
+{
+    NONL=""
+    if [ "$1" == "-n" ]; then
+        NONL="-n"
+        shift
+    fi
+    echo $NONL "$@" >> $RCFILE
+}
+
+kdump_chk()
+{
+    rc=`eval $1` && return $rc
+    echo "$KDUMP_CONFIG_FILE: $2"
+    cleanup_and_exit 1
+}
+
+# Tests if fence_kdump is configured in Pacemaker cluster.
+is_pcs_fence_kdump()
+{
+    [ -x /usr/sbin/fence_kdump_send ] || return 1
+    [ -f "$CLUSTER_CONFIG_FILE" ] || return 1
+}
+
+# Returns list of nodes defined in Pacemaker cluster.
+get_pcs_cluster_nodes()
+{
+    echo "xpath /cluster/clusternodes/clusternode/@name" \
+        | xmllint --shell $CLUSTER_CONFIG_FILE | grep content | cut -d'=' -f2
+}
+
+# get_option_value <option_name>
+# Retrieves value of option defined in /etc/kdump.conf.
+get_option_value()
+{
+    echo $(strip_comments `grep ^$1 /etc/kdump.conf | tail -1 | cut -d\  -f2-`)
+}
+
+# Tests if fence_kdump is configured using options in /etc/kdump.conf.
+is_generic_fence_kdump()
+{
+    [ -x /usr/sbin/fence_kdump_send ] || return 1
+
+    grep -q "^fence_kdump_nodes" /etc/kdump.conf
+}
+
+# Reads list of cluster nodes, filters local IPs and setups network for them.
+# Nodes to send fence_kdump notification to are stored in CLUSTER_NODE_LIST.
+# Other arguments for fence_kdump_send are stored in FENCE_KDUMP_OPTS.
+setup_cluster_nodes_and_options()
+{
+    # setup fence_kdump
+    local nodelist=""
+
+    if is_generic_fence_kdump; then
+        # fence_kdump setup for generic clusters
+        nodelist=$(get_option_value "fence_kdump_nodes")
+
+        # read fence_kdump_send options and store them to FENCE_KDUMP_OPTS
+        FENCE_KDUMP_OPTS=$(get_option_value "fence_kdump_args")
+
+    elif is_pcs_fence_kdump; then
+        # fence_kdump setup for Pacemaker clusters
+        nodelist=$(get_pcs_cluster_nodes)
+
+        # read fence_kdump_send options and store them to FENCE_KDUMP_OPTS
+        if [ -f "$FENCE_KDUMP_CONFIG" ]; then
+            . "$FENCE_KDUMP_CONFIG"
+        fi
+    fi
+
+    if [ -n "$nodelist" ]; then
+        for node in ${nodelist}; do
+            addr=`getent ahostsv4 $node | head -n 1 | cut -d' ' -f1`
+            netdev=`/sbin/ip route get to $addr 2>&1`
+
+            if echo $netdev | grep -q ^local; then
+                continue
+            fi
+
+            # add node ip address to node list
+            CLUSTER_NODE_LIST="$CLUSTER_NODE_LIST $addr"
+
+            if echo $netdev | grep -q via; then
+                netdev=`echo $netdev | awk '{print $5}' | head -n 1`
+            else
+                netdev=`echo $netdev | awk '{print $3}' | head -n 1`
+            fi
+
+            mkdir -p $MNTIMAGE/etc/network/
+            handlenetdev $netdev
+            echo $netdev >> $MNTIMAGE/etc/iface_to_activate
+        done
+
+        if [ -n "$CLUSTER_NODE_LIST" ]; then
+            bin="$bin /usr/sbin/fence_kdump_send"
+        fi
+    fi
+}
+
+if [ -z "$MNTIMAGE" -o -z "$IMAGE" ]; then
+    error "Error creating temporaries.  Try again"
+    cleanup_and_exit 1
+fi
+
+
+# Just get all the modules that are currently loaded
+# We're likely to need them
+for i in `lsmod | tail --lines=+2 | awk '{print $1}'`
+do
+    findmodule -$i skip
+    echo $MODULES | grep -q $i
+    if [ $? -ne 0 ]
+    then
+        ALTERNATE=`echo $i | sed -e's/_/-/g'`
+        findmodule $ALTERNATE skip
+    fi
+
+done
+
+
+#START BUILDING INITRD HERE
+mkdir -p $MNTIMAGE
+mkdir -p $MNTIMAGE/lib
+mkdir -p $MNTIMAGE/bin
+mkdir -p $MNTIMAGE/etc
+mkdir -p $MNTIMAGE/dev
+mkdir -p $MNTIMAGE/proc
+mkdir -p $MNTIMAGE/sys
+mkdir -p $MNTIMAGE/tmp
+mkdir -p $MNTIMAGE/sysroot
+mkdir -p $MNTIMAGE/modules
+mkdir -p $MNTIMAGE/usr/share/udhcpc
+mkdir -p $MNTIMAGE/var/run
+mkdir -p $MNTIMAGE/etc/network/if-pre-up.d
+mkdir -p $MNTIMAGE/etc/network/if-up.d
+mkdir -p $MNTIMAGE/etc/network/if-pre-down.d
+mkdir -p $MNTIMAGE/etc/network/if-down.d
+mkdir -p $MNTIMAGE/etc/network/if-post-down.d
+ln -s bin $MNTIMAGE/sbin
+
+if [ -n "$KDUMP_CONFIG_FILE" ]; then
+    while read config_opt config_val; do
+        # remove inline comments after the end of a directive.
+        config_val=$(strip_comments $config_val)
+        case "$config_opt" in
+        net|nfs|nfs4|ssh)
+            if [ "$config_opt" = "net" ]; then
+                USE_SSH=`echo $config_val | grep @`
+                if [ -n "$USE_SSH" ]; then
+                    USING_METHOD="ssh"
+                else
+                    USING_METHOD="nfs"
+                fi
+            else
+                USING_METHOD="$config_opt"
+            fi
+            #grab remote host and xlate into numbers
+            rhost=`echo $config_val | sed 's/.*@//' | cut -d':' -f1`
+            need_dns=`echo $rhost|grep "[a-zA-Z]"`
+            remoteip=$rhost
+            [ -n "$need_dns" ] && remoteip=`getent ahostsv4 $rhost | head -n 1 | cut -d' ' -f1` 
+
+            #find ethernet device used to route to remote host, ie eth0
+            netdev=`/sbin/ip route get to $remoteip 2>&1`
+            [ $? != 0 ] && echo "Bad kdump location: $config_val" && cleanup_and_exit 1
+            DUMP_TARGET=$config_val
+            #the field in the ip output changes if we go to another subnet
+            OFF_SUBNET=`echo $netdev | grep via`
+            if [ -n "$OFF_SUBNET" ]
+            then
+                # we are going to a different subnet
+                netdev=`echo $netdev|awk '{print $5;}'|head -n 1`
+            else
+                # we are on the same subnet
+                netdev=`echo $netdev|awk '{print $3}'|head -n 1`
+            fi
+           
+            #add the ethernet device to the list of modules 
+            mkdir -p $MNTIMAGE/etc/network/
+            handlenetdev $netdev
+            echo $netdev >> $MNTIMAGE/etc/iface_to_activate
+
+            #load nfs modules, if needed 
+            echo $config_val | grep -v "@" > /dev/null && findmodule nfs
+            ;;
+        raw)
+            USING_METHOD="raw"
+            DUMP_TARGET=$config_val
+            handlelvordev $config_val 0
+            ;;
+        core_collector)
+            if [ -x /usr/sbin/makedumpfile ]; then
+                CORE_COLLECTOR=$config_val
+                grep -q control_d /proc/xen/capabilities 2>/dev/null
+                if [ $? -eq 0 ]
+                then
+                    if [ ! -e /sys/kernel/vmcoreinfo ]
+                    then
+                        CORE_COLLECTOR=`echo $CORE_COLLECTOR | sed -e's/makedumpfile/makedumpfile --xen-vmcoreinfo \/etc\/makedumpfile.config/'`
+                    fi
+                else
+                    if [ ! -e /sys/kernel/vmcoreinfo ]
+                    then
+                        CORE_COLLECTOR=`echo $CORE_COLLECTOR | sed -e's/makedumpfile/makedumpfile -i \/etc\/makedumpfile.config/'`
+                    fi
+                fi
+            else
+                echo "Cannot use the core_collector option on this arch"
+                cleanup_and_exit 1
+            fi
+            ;;
+        path)
+            SAVE_PATH=$config_val
+            ;;
+        link_delay)
+            LINK_DELAY=$config_val
+            ;;
+        kdump_post)
+            KDUMP_POST=$config_val
+            if [ ! -x "$KDUMP_POST" ]; then
+                echo "$KDUMP_POST not executable or not found"
+                cleanup_and_exit 1
+            fi
+            bin="$bin $KDUMP_POST"
+            KDUMP_POST_INTERNAL=`echo $KDUMP_POST | sed -e's/\(^.*\/\)\(.*$\)/\/bin\/\2/'`
+            ;;
+        kdump_pre)
+            KDUMP_PRE=$config_val
+            if [ ! -x "$KDUMP_PRE" ]; then
+                echo "$KDUMP_PRE not executable or not found"
+                cleanup_and_exit 1
+            fi
+            bin="$bin $KDUMP_PRE"
+            KDUMP_PRE_INTERNAL=`echo $KDUMP_PRE | sed -e's/\(^.*\/\)\(.*$\)/\/bin\/\2/'`
+            ;;
+        extra_bins)
+            bin="$bin $config_val"
+            ;;
+        extra_modules)
+            extra_kdump_mods="$extra_kdump_mods $config_val"
+            ;;
+        blacklist)
+            if echo "$config_val" | grep -q "\/" ; then
+                echo "Do not support the directory \"$config_val\" for blacklist"
+                cleanup_and_exit 1
+            fi
+            blacklist_mods="$blacklist_mods $config_val"
+            ;;
+	options)
+	    ;;
+        force_rebuild)
+            ;;
+        default)
+            DEFAULT_ACTION=$config_val
+            case $DEFAULT_ACTION in
+                reboot|shell|mount_root_run_init)
+                        FINAL_ACTION="reboot -f"
+                        ;;
+                halt)
+                        FINAL_ACTION="halt -f"
+                        ;;
+                poweroff)
+                        FINAL_ACTION="poweroff -f"
+                        ;;
+		*)
+                        echo "$DEFAULT_ACTION is not a valid default option"
+                        cleanup_and_exit 1
+		        ;;
+            esac
+            ;;
+        disk_timeout)
+            DISK_TIMEOUT=$config_val
+            ;;
+        debug_mem_level)
+            DEBUG_MEM_LEVEL=$config_val
+            echo "$DEBUG_MEM_LEVEL" | grep "^[0-3]$" &> /dev/null
+            if [ $? -ne 0 ]
+            then
+                echo "debug_mem_level is valid only for range 0-3"
+                cleanup_and_exit 1
+            fi
+            ;;
+        sshkey)
+            if [ -f "$config_val" ]; then
+                # canonicalize the path
+                SSH_KEY_LOCATION=$(/usr/bin/readlink -m $config_val)
+            else
+                echo "WARNING: '$config_val' doesn't exist, using default value '$SSH_KEY_LOCATION'"
+            fi
+            ;;
+        Kdump_not_supported_on_Xen_domU_guest)
+            cat << HERE
+Since RHEL 6.3 there is limited support for kdump on full-virt Xen DomU.
+This kdump.conf marker may now be removed on supported configurations.
+See KCS Solution 92943 for more details.
+HERE
+            ;;
+        fence_kdump_nodes)
+            ;;
+        fence_kdump_args)
+            ;;
+        *)
+            IS_COMMENT=`echo $config_opt | grep "^#.*$"`
+            if [ -n "$IS_COMMENT" -o -z "$config_opt" ]
+            then
+                     #don't process comments or blank line
+                     continue
+            fi
+	    let grep_rc=0
+            echo $config_opt | grep -q "ext[234]"
+            ga_rc=$?
+            echo $config_opt | grep -q "minix"
+            gb_rc=$?
+            echo $config_opt | grep -q "xfs"
+            gc_rc=$?
+            echo $config_opt | grep -q "btrfs"
+            gd_rc=$?
+            if [ $ga_rc -ne 0 -a $gb_rc -ne 0 -a $gc_rc -ne 0 -a $gd_rc -ne 0 ]
+            then
+                echo "Unknown parameter " $config_opt
+                cleanup_and_exit 1
+            fi
+            USING_METHOD="filesystem"
+            if (echo $config_val | egrep -q "^(LABEL|UUID)="); then
+                # We need to "strip" the quotes in LABEL or UUID,
+                # otherwise it will be passed into findfs as a part of
+                # LABEL or UUID. Note a label name itself may contain
+                # spaces and quotes.
+                config_val=$(eval echo $config_val)
+                if [ -z "$config_val" ] ;then
+                    cleanup_and_exit 1
+                fi
+            fi
+            DUMP_FSTYPE=$config_opt
+            DUMP_TARGET=$config_val
+            handlelvordev $config_val 0
+            ;;
+        esac
+
+    done < $KDUMP_CONFIG_FILE
+fi
+
+# Include vmcore-dmesg and associated dependencies.
+if [ ! -f "$DMESG_COLLECTOR" ];then
+    echo "Error: $DMESG_COLLECTOR is not present"
+    cleanup_and_exit 1
+fi
+bin="$bin $DMESG_COLLECTOR"
+
+# If user did not specify a default action, set the defaults.
+if [ -z "$DEFAULT_ACTION" ];then
+	DEFAULT_ACTION="reboot"
+	FINAL_ACTION="reboot -f"
+fi
+
+# if default is mount root and run init, then add root fs.
+if [ "$DEFAULT_ACTION" == "mount_root_run_init" ];then
+    add_rootfs
+fi
+
+setup_cluster_nodes_and_options
+
+# if no method was specified default to the currently booted filesystem
+if [ -z "$USING_METHOD" ]
+then
+    mkdir -p $SAVE_PATH
+    mntpoint=`df $SAVE_PATH | tail -1 | awk '{ print $NF }'`
+    DUMP_TARGET=`mount | awk '$3 == "'$mntpoint'" { print $1 }'`
+    DUMP_UUID=$(blkid -s UUID $DUMP_TARGET|cut -d ' ' -f2|tr -d '\042')
+    [[ "$DUMP_UUID" =~ "UUID=" ]] && DUMP_TARGET="$DUMP_UUID"
+    DUMP_FSTYPE=`mount | awk '$3 == "'$mntpoint'" { print $5 }'`
+    handlelvordev $DUMP_TARGET 0
+    if [ "$mntpoint" != "/" ]
+    then
+        SAVE_PATH=`echo $SAVE_PATH | sed "s,$mntpoint,,"`
+    fi
+fi
+
+if [ "$DUMP_FSTYPE" = "btrfs" ]
+then
+    kdump_chk "test -f /sbin/btrfsck" "/sbin/btrfsck not found. Install package btrfs-progs and retry"
+    bin="$bin /sbin/btrfsck"
+elif [ "$DUMP_FSTYPE" = "xfs" ]
+then
+    :
+elif [ -n "$DUMP_FSTYPE" ]
+then
+    kdump_chk "test -f /sbin/fsck.$DUMP_FSTYPE" "fsck.$DUMP_FSTYPE not found. Install package e2fsprogs and retry."
+fi
+
+[ -n "$DUMP_FSTYPE" ] && findmodule $DUMP_FSTYPE
+
+# If there are ISCSI devices found in dump target path, include some associated
+# files and modules.
+prepare_iscsi_target () {
+    if [ -n "$ISCSI_DEVICES" ];then
+        kdump_chk "test -f /sbin/iscsiadm" "Can't find /sbin/iscsiadm"
+        bin="$bin /sbin/iscsiadm"
+
+        kdump_chk "test -f /sbin/iscsid" "Can't find /sbin/iscsid"
+        bin="$bin /sbin/iscsid"
+
+        # Pack /var/lib/iscsi/* and /etc/iscsi/*
+        mkdir -p $MNTIMAGE/var/lib/iscsi/
+        cp -r /var/lib/iscsi/* $MNTIMAGE/var/lib/iscsi/
+        mkdir -p $MNTIMAGE/etc/iscsi/
+        cp -r /etc/iscsi/* $MNTIMAGE/etc/iscsi/
+
+        # iscsiadm does not like it if following does not exist.
+        mkdir -p $MNTIMAGE/var/lock/iscsi/
+
+        # Put list of targets in a file
+        mkdir -p $MNTIMAGE/etc/
+        echo "$ISCSI_TARGETS" | sed 's/^ //'> $MNTIMAGE/etc/iscsi_targets_to_activate
+       vecho "Will activate following targets: `cat $MNTIMAGE/etc/iscsi_targets_to_activate`"
+
+    fi
+}
+
+prepare_iscsi_target
+
+inst_scsi_id() {
+    mkdir -p "$MNTIMAGE/lib/udev"
+    inst /lib/udev/scsi_id "$MNTIMAGE/lib/udev/scsi_id"
+    ln -s "/lib/udev/scsi_id" "$MNTIMAGE/bin/scsi_id"
+}
+
+# If there are dm multipath devices found in dump target path, include some
+# associated files and modules.
+prepare_multipath_target () {
+    local tempfile
+    local bindings
+    local libdir
+    local f
+
+    [ -z "$multipath_devices" ] && return
+
+    vecho "Prepare multipath related files"
+
+    kdump_chk "test -f /sbin/multipath" "Can't find /sbin/multipath"
+    bin="$bin /sbin/multipath"
+    vecho "Adding /sbin/multipath"
+
+    if [ -f /etc/multipath.conf ]; then
+        inst /etc/multipath.conf $MNTIMAGE/etc/multipath.conf
+    fi
+
+    kdump_chk "test -f /sbin/multipathd" "Can't find /sbin/multipathd"
+    bin="$bin /sbin/multipathd"
+    vecho "Adding /sbin/multipathd"
+
+    # Pack findfs and blkid also. Busybox findfs is not working well with
+    # multipath devices where it can return a child component device for
+    # a uuid instead of top level multipath device.
+    kdump_chk "test -f /sbin/findfs" "Can't find /sbin/findfs"
+    bin="$bin /sbin/findfs"
+    vecho "Adding /sbin/findfs"
+
+    kdump_chk "test -f /sbin/blkid" "Can't find /sbin/blkid"
+    bin="$bin /sbin/blkid"
+    vecho "Adding /sbin/blkid"
+
+    # blkid command can save blkid.tab cache file if this dir is present.
+    # primarily helpful for debugging.
+    mkdir -p $MNTIMAGE/etc/blkid/
+
+    mkdir -p $MNTIMAGE/tmp
+
+    # For kpartx command which creates device maps for disk partitions
+    # and creates device files
+    kdump_chk "test -f /sbin/dmsetup" "Can't find /sbin/dmsetup"
+    bin="$bin /sbin/dmsetup"
+    vecho "Adding /sbin/dmsetup"
+
+    kdump_chk "test -f /sbin/kpartx" "Can't find /sbin/kpartx"
+    bin="$bin /sbin/kpartx"
+    vecho "Adding /sbin/kpartx"
+
+    if ldd $(which multipath) 2>/dev/null |grep -q lib64; then
+        libdir="/lib64"
+    else
+        libdir="/lib"
+    fi
+
+    mkdir -p $MNTIMAGE/$libdir/multipath
+    mkdir -p $MNTIMAGE/etc/multipath
+    mkdir -p $MNTIMAGE/lib/udev
+
+    # /lib64/multipath/libcheckdirectio.so requires libaio
+    for f in \
+        /etc/multipath/* \
+        $(ls $libdir/libaio* 2>/dev/null) \
+        $(ls $libdir/multipath/* 2>/dev/null); do
+        [ -e "$f" ] && inst "$f" "$MNTIMAGE/$f"
+    done
+}
+
+inst_scsi_id
+prepare_multipath_target
+
+#if we are using makedumpfile here, then generate the config file
+#also only build this config if we don't have vmcoreinfo on this kernel
+if [ -n "$CORE_COLLECTOR" -a ! -e /sys/kernel/vmcoreinfo ]; then
+    RUN_KERN_VER=`uname -r`
+    if [ ! -f /usr/lib/debug/lib/modules/$RUN_KERN_VER/vmlinux ]
+    then
+	echo "kernel-debuginfo-$RUN_KERN_VER is not installed.  You need this to use makedumpfile!"
+	echo "please install it and restart the kdump service"
+	cleanup_and_exit 1
+    fi
+    XEN_OPTS=""
+    grep -q control_d /proc/xen/capabilities 2>/dev/null
+    if [ $? -eq 0 ]
+    then
+	# This is a dom0 xen kernel so we need to add xen-syms to the
+	# makedumpefile config
+	RUN_XEN_VER=${RUN_KERN_VER%xen}
+	if [ ! -f /usr/lib/debug/boot/xen-syms-$RUN_XEN_VER.debug ]
+	then
+	    echo "xen-syms.debug not found and is needed on this kernel to use makedumpfile!"
+	    echo "please install it and restart the kdump service"
+	    cleanup_and_exit 1
+	fi
+
+	XEN_OPTS="--xen-syms /usr/lib/debug/boot/xen-syms-$RUN_XEN_VER.debug"
+	/usr//sbin/makedumpfile -g $MNTIMAGE/etc/makedumpfile.config $XEN_OPTS  > /dev/null 2>&1
+    else
+	/usr//sbin/makedumpfile -g $MNTIMAGE/etc/makedumpfile.config -x /usr/lib/debug/lib/modules/$RUN_KERN_VER/vmlinux > /dev/null 2>&1
+    fi
+    if [ $? != 0 ]; then
+	echo "could not generate makedumpfile configuration.  aborting"
+	cleanup_and_exit 1
+    fi
+fi
+
+#include extra user-specified modules for kdump initrd
+for n in $extra_kdump_mods; do
+    findmodule $n
+done
+
+# After we get all the modules, lets depsolve the list
+# so that we load them in proper order
+depsolve_modlist
+
+#copy in busybox and make symlinks to its supported utilities
+cp /sbin/busybox $MNTIMAGE/sbin/busybox
+bin="$bin /sbin/busybox"
+cd $MNTIMAGE/sbin
+for i in `/sbin/busybox | 
+        awk 'BEGIN {found=0} /.*/ { if (found) print $0 } /Currently/ {found=1}' | 
+        sed -e's/,//g' -e's/busybox//g'`
+do
+        ln -s busybox $MNTIMAGE/sbin/$i
+done
+cd - > /dev/null 2>&1
+
+if [ -f /etc/mdadm.conf ]
+then
+        cp /etc/mdadm.conf $MNTIMAGE/etc
+        bin="$bin /sbin/mdadm"
+fi
+
+# we need the fstab file so that we can fsck properly
+cp /etc/fstab $MNTIMAGE/etc/fstab
+bin="$bin /sbin/fsck.ext2 /sbin/fsck.ext3 /sbin/fsck.ext4"
+
+if [ -f "$TMPDISKLIST" ]; then
+    mv $TMPDISKLIST $MNTIMAGE/etc/critical_disks
+fi
+
+#THIS IS WHERE WE GENERATE OUR ADDITINONAL UTILITIES
+#Busybox doesn't have a /bin/sh applet, 
+#so we build a reasonable faximilie here
+cat >> $MNTIMAGE/bin/sh << EOF
+#!/bin/hush
+#drop the -c from the command line
+shift 1
+#now execute the passed command
+#don't exec this or $@ won't work
+/bin/hush -c "\$@"
+EOF
+
+chmod 755 $MNTIMAGE/bin/sh
+
+cat >> $MNTIMAGE/usr/share/udhcpc/default.script << EOF
+#!/bin/hush
+[ -z "\$1" ] && echo "Error: should be called from udhcpc" && exit 1
+
+
+case "\$1" in
+    deconfig)
+        /sbin/ifconfig \$interface 0.0.0.0
+        ;;
+
+    renew|bound)
+        /sbin/ifconfig \$interface \$ip netmask \$subnet
+
+        if [ -n "\$router" ] ; then
+            echo "deleting routers"
+            while route del default gw 0.0.0.0 dev \$interface 2>/dev/null ; do
+                :
+            done
+
+            for i in \$router ; do
+                route add default gw \$i dev \$interface
+            done
+        fi
+
+        echo -n > /etc/resolv.conf 
+        [ -n "\$domain" ] && echo search \$domain >> /etc/resolv.conf 
+        for i in \$dns ; do
+            echo adding dns \$i
+            echo nameserver \$i >> /etc/resolv.conf 
+        done
+        ;;
+
+    *)
+        echo "Unable to get a DHCP address retry..."
+        exit 1
+        ;;
+esac
+
+exit 0
+EOF
+
+#NETWORKING SCRIPT DIRECTORIES
+cat >> $MNTIMAGE/etc/network/if-pre-up.d/pre-up-script << EOF
+#!/bin/hush
+PATH=\$PATH:/scriptfns
+. /etc/ifcfg-\$IFACE
+
+link_delay()
+{
+        if [ -n "\$LINK_DELAY" ]
+        then
+            echo "\$IFACE Link Up.  Waiting \$LINK_DELAY Seconds"
+            sleep \$LINK_DELAY
+            echo "Continuing"
+        fi
+}
+
+LINK_DELAY=$LINK_DELAY
+if [ "\$BUS_ID" == "Bridge" ]
+then
+    brctl addbr \$IFACE
+    brctl setfd \$IFACE 1
+fi
+
+bring_up_bond_interface()
+{
+    BOND_MASTER=\$1
+
+    if [ ! -f /sys/class/net/\$BOND_MASTER ]; then
+        echo +\$BOND_MASTER > /sys/class/net/bonding_masters
+        #this is a bond find and bring up the slaves
+        echo searching for slaves
+        find_activate_slaves \$BOND_MASTER
+    fi
+}
+
+if [ "\$BUS_ID" == "Bonding" ]
+then
+    bring_up_bond_interface \$IFACE
+elif [ "\$BUS_ID" == "Vlan" ]
+then
+    case "\$IFACE" in
+    vlan*)
+        VLAN_ID=\${IFACE#vlan*}
+        ifup \$PHYSDEV
+        vconfig add \$PHYSDEV \$VLAN_ID
+        ip link set \$PHYSDEV.\$VLAN_ID name \$IFACE
+        ;;
+    *.*)
+        #bring up the base interface first
+        BASE_DEV=\`echo \$IFACE | cut -d"." -f1\`
+        VLAN_ID=\`echo \$IFACE | cut -d"." -f2\`
+        ifup \$BASE_DEV
+        vconfig add \$BASE_DEV \$VLAN_ID
+        ;;
+    esac
+elif [ "\$BUS_ID" == "Bridge" ]
+then
+    echo searching for bridge members
+    find_bridge_members \$IFACE
+fi
+ifconfig \$IFACE up
+link_delay
+exit 0
+EOF
+
+for i in `ls $MNTIMAGE/etc/network/if-pre-up.d`
+do
+    chmod 755 $MNTIMAGE/etc/network/if-pre-up.d/$i
+done
+
+cat >> $MNTIMAGE/etc/network/if-up.d/up-script << EOF
+#!/bin/hush
+PATH=\$PATH:/scriptfns
+if [ "\$METHOD" != "dhcp" ]
+then
+    . /etc/ifcfg-\$IFACE
+    if [ -n "\$IPADDR" ]
+    then
+        ifconfig \$IFACE \$IPADDR netmask \$NETMASK
+    else
+        ifconfig \$IFACE up
+    fi
+fi
+exit 0
+EOF
+
+for i in `ls $MNTIMAGE/etc/network/if-up.d`
+do
+    chmod 755 $MNTIMAGE/etc/network/if-up.d/$i
+done
+
+chmod 755 $MNTIMAGE/usr/share/udhcpc/default.script
+
+# WE DONT HAVE FUNCTIONS AVAILABLE IN MSH
+# SO WE IMPLEMENT THEM HERE AS scripts
+SCRIPTDIR=$MNTIMAGE/scriptfns
+mkdir -p $SCRIPTDIR
+
+cat >> $SCRIPTDIR/load_selinux_policy << EOF
+#!/bin/hush
+
+ROOTPATH=\$1
+NEEDSELINUX=1
+LOADPOL=
+grep -q selinux=0 /proc/cmdline
+if [ \$? -eq 0 ]
+then
+	NEEDSELINUX=0
+fi
+
+if [ -x \$ROOTPATH/usr/sbin/load_policy ]
+then
+	LOADPOL=/usr/sbin/load_policy
+fi
+if [ -x \$ROOTPATH/sbin/load_policy ]
+then
+	LOADPOL=/sbin/load_policy
+fi
+
+if [ \$NEEDSELINUX -eq 1 -a -n "\$LOADPOL" ]
+then
+	echo "Loading SELINUX policy"
+	chroot \$ROOTPATH \$LOADPOL -i
+        if [ \$? -ge 2 ]
+        then
+            echo "Policy load failed, a relabel will be required on reboot"
+        fi 
+fi
+EOF
+
+cat >> $SCRIPTDIR/show_memstats << EOF
+#!/bin/hush
+while [ \$# -gt 0 ]; do
+    case \$1 in
+        shortmem)
+            cat /proc/meminfo  | grep -e "^MemFree" -e "^Cached" -e "^Slab"
+            ;;
+        mem)
+            cat /proc/meminfo
+            ;;
+        slab)
+            cat /proc/slabinfo
+            ;;
+        iomem)
+            cat /proc/iomem
+            ;;
+    esac
+    shift
+done
+echo
+EOF
+
+cat >> $SCRIPTDIR/map_interface << EOF
+#!/bin/hush
+if [ -e /tmp/tmpcnt ]
+then
+    TMPCNT=\`cat /tmp/tmpcnt\`
+else
+    TMPCNT=0
+fi
+#erase previously recorded map
+RENAMED=""
+REAL_DEV=""
+HWADDR=""
+NETDEV=\$1
+. /etc/ifcfg-\$NETDEV
+HWADDR=\`echo "\$HWADDR" | awk '{print toupper(\$1)}'\`
+for j in \`ifconfig -a | awk '/.*Link encap.*/ {print \$1}'\`
+do
+    case "\$BUS_ID" in
+    Bonding)
+        REAL_DEV=\$NETDEV
+        RENAMED="yes"
+        ;;
+    Vlan)
+        case "\$NETDEV" in
+        vlan*)
+            REAL_DEV=\$NETDEV
+            BASE_DEV=\$PHYSDEV
+            REAL_BASE=\`grep "^\$BASE_DEV " /etc/iface_map | cut -d" " -f2\`
+            sed -i -e "s/PHYSDEV=\$BASE_DEV/PHYSDEV=\$REAL_BASE/" /etc/ifcfg-\$NETDEV
+            RENAMED="yes"
+            ;;
+        *.*)
+            BASE_DEV=\`echo \$NETDEV | cut -d"." -f1\`
+            VLAN_ID=\`echo \$NETDEV | cut -d"." -f2\`
+            REAL_BASE=\`grep "^\$BASE_DEV " /etc/iface_map | cut -d" " -f2\`
+            REAL_DEV=\$REAL_BASE.\$VLAN_ID
+            NETDEV=\$BASE_DEV.\$VLAN_ID
+            RENAMED="yes"
+            ;;
+        esac
+        ;;
+    Bridge)
+        REAL_DEV=\$NETDEV
+        RENAMED="yes"
+        ;;
+    *)
+        INFO=\`ls -l /sys/class/net/\$j/device 2>/dev/null |  sed -e's/\\(.*\\/\\)\\(.*$\\)/\\2/'\`
+        if [ "\$INFO" == "\$BUS_ID" -a -z "\$REAL_DEV" ]
+        then
+            # Some multiport network cards report one BUS address
+            # for all ports.  In such cases differentiate the ports by
+            # the MAC address if it is included in the ifcfg-ethn file
+            # as HWADDR.
+            NUM_NIC_PORTS=\`ls /sys/class/net/\$j/device/net 2>/dev/null | grep -c .\`
+            if [ "\$HWADDR" -a "\$NUM_NIC_PORTS" -gt 1 ]
+            then
+                REAL_MAC=\`ifconfig \$j | awk '/.*HWaddr.*/ {print toupper(\$5)}'\`
+                if [ "\$HWADDR" == "\$REAL_MAC" ]
+                then
+                    REAL_DEV=\$j
+                    RENAMED="yes"
+                fi
+            else
+                REAL_DEV=\$j
+                RENAMED="yes"
+            fi
+        fi
+        ;;
+    esac
+done
+
+if [ -z "\$RENAMED" ]
+then
+    echo "Could not find a mapping for device \$NETDEV"
+    exit 1
+fi
+
+#build the interface rename map
+echo \$NETDEV \$REAL_DEV tmp\$TMPCNT >> /etc/iface_map
+TMPCNT=\`echo \$TMPCNT 1 + p | dc\`
+echo \$TMPCNT > /tmp/tmpcnt
+echo mapping \$NETDEV to \$REAL_DEV
+EOF
+
+cat >> $SCRIPTDIR/rename_interfaces << EOF
+#!/bin/hush
+
+rename_iface_in_file()
+{
+    local i=\$1
+    local CURRENT=\$2
+    local INTERIM=\$3
+
+    fname=\$(basename \$i)
+    case \$fname in
+        ifcfg-*)
+            # Replace iface occurences only in DEVICE lines
+            sed -i 's,'"\(^DEVICE=\)\"\?\$CURRENT\"\?\$"','"\1\$INTERIM"',' \$i
+            ;;
+        iface_to_activate)
+            # Replace iface occurences in lines containg exact this iface
+            sed -i 's,'"^\$CURRENT\$"','"\$INTERIM"',' \$i
+            ;;
+        interfaces)
+            # Replace iface occurences only in iface lines
+            sed -i 's,'"\(^iface\ \)\$CURRENT\ "','"\1\$INTERIM\ "',' \$i
+            ;;
+    esac
+}
+
+MAP_COUNT=\`awk 'END{print NR}' /etc/iface_map\`
+#now do all the renaming - first to temp space
+for j in \`seq 1 1 \$MAP_COUNT\`
+do
+    CURRENT=\`awk -v MATCH=\$j '{if (NR == MATCH) print \$1}' /etc/iface_map\`
+    NEW=\`awk -v MATCH=\$j '{if (NR == MATCH) print \$2}' /etc/iface_map\`
+    INTERIM=\`awk -v MATCH=\$j '{if (NR == MATCH) print \$3}' /etc/iface_map\`
+    mv /etc/ifcfg-\$CURRENT /etc/ifcfg-\$INTERIM
+    for i in /etc/ifcfg-\$INTERIM /etc/iface_to_activate /etc/network/interfaces
+    do
+        rename_iface_in_file "\$i" "\$CURRENT" "\$INTERIM"
+    done
+
+    if [ -f /etc/network/route-static ]
+    then
+        # the double quotes lets us expand the variables
+        sed -i 's,'"\(.*dev\) \$CURRENT"','"\1 \$INTERIM"',g' /etc/network/route-static
+    fi
+
+done
+
+
+for j in \`seq 1 1 \$MAP_COUNT\`
+do
+    CURRENT=\`awk -v MATCH=\$j '{if (NR == MATCH)  print \$1}' /etc/iface_map\`
+    NEW=\`awk -v MATCH=\$j '{if (NR == MATCH) print \$2}' /etc/iface_map\`
+    INTERIM=\`awk -v MATCH=\$j '{if (NR == MATCH) print \$3}' /etc/iface_map\`
+    mv /etc/ifcfg-\$INTERIM /etc/ifcfg-\$NEW
+    for i in /etc/ifcfg-\$NEW /etc/iface_to_activate /etc/network/interfaces
+    do
+        rename_iface_in_file "\$i" "\$INTERIM" "\$NEW"
+    done
+
+    if [ -f /etc/network/route-static ]
+    then
+        # the double quotes lets us expand the variables
+        sed -i 's,'"\(.*dev\) \$INTERIM"','"\1 \$NEW"',g' /etc/network/route-static
+    fi
+
+    IS_BOND=\`echo /etc/ifcfg-\$NEW | grep bond\`
+    if [ -n "\$IS_BOND" ]
+    then
+        for i in \`ls /etc/ifcfg-*\`
+        do
+            awk -v str2="MASTER=\$NEW" "{gsub(/.*MASTER=\$CURRENT.*/,str2);print}" \$i > \$i.tmp
+            mv \$i.tmp \$i
+        done
+    fi
+done
+
+rm -f /etc/iface_map
+
+exit 0
+EOF
+
+cat >> $SCRIPTDIR/find_activate_slaves << EOF
+#!/bin/hush
+BOND_MASTER=\$1
+
+for j in \`ls /etc/ifcfg-*\`
+do
+    MASTER=""
+    touch \$j
+    . \$j
+    if [ "\$MASTER" == "\$BOND_MASTER" ]
+    then
+        dev=\`echo \$j | cut -d'-' -f2-\`
+        #this is a slave of the rising interface
+        echo enslaving \$dev to \$BOND_MASTER
+        echo +\$dev > /sys/class/net/\$BOND_MASTER/bonding/slaves
+        ifup \$dev
+    fi
+done
+EOF
+
+cat >> $SCRIPTDIR/find_bridge_members << EOF
+#!/bin/msh
+
+for j in \`ls /etc/ifcfg-*\`
+do
+    touch \$j
+    BRIDGE=""
+    . \$j
+    if [ "\$1" == "\$BRIDGE" ]
+    then
+        dev=\`echo \$j | cut -d'-' -f2-\`
+        ifconfig \$dev promisc
+        ifup \$dev
+        echo adding \$dev to \$1
+        brctl addif \$1 \$dev
+    fi
+done
+EOF
+
+cat >> $SCRIPTDIR/add_route << EOF
+#!/bin/hush
+file=\$1
+
+handle_ip_file() {
+    local f t type= file=\$1 proto="-4"
+    f=\${file##*/}
+    t=\${f%%-*}
+    type=\${t%%6}
+    if [ "\$type" != "\$t" ]; then
+        proto="-6"
+    fi
+    cat "\$file"
+    nr_lines=\$(wc -l < "\$file")
+    for i in \`seq 1 \$nr_lines\`; do
+        line=\$(awk -v li=\$i '{if(NR==li){print}}' \$file)
+        /sbin/ip \$proto \$type add \$line
+    done
+}
+if [ -f "\$file" ]; then
+    handle_ip_file \$file
+fi
+EOF
+
+
+cat >> $SCRIPTDIR/monitor_dd_progress << EOF
+#!/bin/hush
+SRC_FILE_SIZE=\`ls -l /proc/vmcore | awk '{print \$5}'\`
+BLOCK_SIZE=\$1
+SRC_FILE_MB=\`dc \$SRC_FILE_SIZE 1048576 / p\`
+
+while true
+do
+        DD_PID=\`pidof dd\`
+        if [ -n "\$DD_PID" ]
+        then
+                break
+        fi
+done
+
+while true
+do
+        sleep 5
+        if [ ! -d /proc/\$DD_PID ]
+        then
+                break
+        fi
+
+        kill -SIGUSR1 \$DD_PID
+        CURRENT_SIZE=\`tail -n 1 /tmp/dd_progress_file | sed "s/[^0-9].*//g"\`
+        CURRENT_MB=\`dc \$CURRENT_SIZE \$BLOCK_SIZE \* 1048576 / p\`
+        echo -n -e "Copied \$CURRENT_MB MB / \$SRC_FILE_MB MB\\\r"
+done
+
+rm -f /tmp/dd_progres_file
+EOF
+
+cat >> $SCRIPTDIR/monitor_scp_progress << EOF
+#!/bin/hush
+SRC_FILE_SIZE=\`ls -l /proc/vmcore | awk '{print \$5}'\`
+LOCATION=\$1
+REMOTE_FILE=\$2
+
+SRC_FILE_MB=\`dc \$SRC_FILE_SIZE 1048576 / p\`
+
+while true
+do
+        SCP_PID=\`pidof scp | awk '{print \$1}'\`
+        if [ -n "\$SCP_PID" ]
+        then
+                break
+        fi
+done
+
+while true
+do
+        sleep 5
+        if [ ! -d /proc/\$SCP_PID ]
+        then
+                break
+        fi
+
+        SSH_OUTPUT=\`ssh -q -i $SSH_KEY_LOCATION -o BatchMode=yes \$LOCATION ls -l \$REMOTE_FILE\`
+        REMOTE_SIZE=\`echo \$SSH_OUTPUT | awk '{print \$5}'\`
+        REMOTE_SIZE_MB=\`dc \$REMOTE_SIZE 1048576 / p\`
+        echo -n -e "Copied \$REMOTE_SIZE_MB MB / \$SRC_FILE_MB MB\\\r"
+done
+
+EOF
+
+cat >> $SCRIPTDIR/monitor_cp_progress <<EOF
+#!/bin/hush
+SRC_FILE_SIZE=\`ls -l /proc/vmcore | awk '{print \$5}'\`
+DST_FILE=\$1
+
+SRC_FILE_MB=\`dc \$SRC_FILE_SIZE 1048576 / p\`
+
+while true
+do
+        CP_PID=\`pidof cp\`
+        if [ -n "\$CP_PID" ]
+        then
+                break
+        fi
+done
+
+while true
+do
+        sleep 5
+        if [ ! -d /proc/\$CP_PID ]
+        then
+                break
+        fi
+
+        LS_SIZE=\`ls -l \$DST_FILE | awk '{print \$5}'\`
+        LS_MB=\`dc \$LS_SIZE 1048576 / p\`
+        echo -n -e "Copied \$LS_MB MB / \$SRC_FILE_MB MB\\\r"
+done
+
+EOF
+
+cat >> $SCRIPTDIR/handle_event <<EOF
+#!/bin/hush
+
+FIRMWARE_DIRS="/lib/firmware"
+
+if [ "\$ACTION" != "add" ]
+then
+	exit 0
+fi
+
+if [ "\$SUBSYSTEM" != "firmware" ]
+then
+	exit 0
+fi
+
+for DIR in \$FIRMWARE_DIRS; do
+	if [ ! -f \$DIR/\$FIRMWARE ]
+	then
+		continue
+	fi
+	echo 1 > /sys\$DEVPATH/loading
+	cat "\$DIR/\$FIRMWARE" > /sys\$DEVPATH/data
+	echo 0 > /sys\$DEVPATH/loading
+	exit 0
+done
+
+EOF
+
+cat >> $SCRIPTDIR/display_mem_usage <<EOF
+#!/bin/hush
+
+FREEMEM=\`free | awk '/^ *Mem:/ {print \$4}'\`
+TOTALMEM=\`free | awk '/^ *Mem:/ {print \$2}'\`
+FREEPCT=\`dc \$FREEMEM \$TOTALMEM / 100 \* p\`
+
+echo -n "Free memory/Total memory (free %): "
+echo \$FREEMEM / \$TOTALMEM  \( \$FREEPCT \)
+EOF
+
+# If iscsi devices are in boot path, load a script to start connections.
+cat >> $SCRIPTDIR/iscsi_start <<EOF
+#!/bin/hush
+ISCSIDIR="/var/lib/iscsi/nodes/"
+ISCSITARGETFILE="/etc/iscsi_targets_to_activate"
+
+if [ ! -d \$ISCSIDIR ];then
+    exit 0
+fi
+
+if [ ! -f \$ISCSITARGETFILE ];then
+    exit 1
+fi
+
+/sbin/iscsid
+for iscsi_target in \`cat /etc/iscsi_targets_to_activate\`;do
+    echo "Activating iscsi target: \$iscsi_target"
+    /sbin/iscsiadm -m node -T \$iscsi_target -l
+done
+
+EOF
+
+# A script to do multipath related processing like creating device nodes.
+cat >> $SCRIPTDIR/process_multipath <<EOF
+#!/bin/hush
+find_dev_in_sysblock () {
+    local majmin=\$1
+    find /sys/block/ -name dev | while read device; do \
+    echo "\$majmin" | cmp -s \$device && echo \$device ; done \
+    | sed -e 's,/dev$,,'
+}
+
+#Create /dev/mpath dir
+mkdir -p /dev/mpath/
+
+maj_min=\`dmsetup ls --target multipath | sed 's/.*(\([0-9]*\), \([0-9]*\)).*/\1:\2/'\`
+
+for majmin in \$maj_min; do
+   sysdev=\`find_dev_in_sysblock \$majmin\`
+   if [ -n "\$sysdev" ]; then
+        major=\`echo \$majmin | cut -d ":" -f1\`
+        minor=\`echo \$majmin | cut -d ":" -f2\`
+        devnode=\`echo \$sysdev | sed 's,/sys/block/,/dev/,'\`
+        echo "Creating multipath node \$devnode(\$majmin), sys=\$sysdev"
+        mknod \$devnode b \$major \$minor
+        # create /dev/mpath/* soft links
+        mpathnode=\`dmsetup ls --target multipath | grep "(\${major}, \${minor})" | cut -f1\`
+        if [ -n "\$mpathnode" ];then
+            ln -s \$devnode /dev/mpath/\$mpathnode
+        fi
+   fi
+done
+
+EOF
+
+install_ccw_net_init()
+{
+    cat >> $SCRIPTDIR/ccw_net_init <<EOF
+#!/bin/hush
+
+BLACKLIST="/proc/cio_ignore"
+CIO_SETTLE="/proc/cio_settle"
+
+timedwait_for_path()
+{
+    local somepath=\$1
+    local i=0
+    while [ \$i -lt 20 ]; do
+        [ -e \$somepath ] && break
+        sleep 0.1
+        i=\$((\$i + 1))
+    done
+    if [ ! -e \$somepath ]; then
+        echo "timed out while waiting for: \$somepath"
+        exit 1
+    fi
+}
+
+ifcfg_file=\$1
+NETDEV=\`echo \$ifcfg_file | cut -d'-' -f2\`
+. \$ifcfg_file
+
+echo "ccw_net_init \$NETDEV \$ifcfg_file"
+
+if [ -z "\$SUBCHANNELS" -o -z "\$NETTYPE" -o -z "\$DEVICE" ]; then
+    echo "no SUBCHANNELS,NETTYPE or DEVICE in \$ifcfg_file"
+    echo "dont know how to init \$NETDEV:"
+    cat \$ifcfg_file
+    exit 1
+fi
+
+#remove from blacklist
+echo "free \$SUBCHANNELS" > \$BLACKLIST
+if [ \$? -ne 0 ]; then
+    echo "Failed to free \$i from \$BLACKLIST"
+fi
+echo 1 > \$CIO_SETTLE
+
+#group buses
+timedwait_for_path "/sys/bus/ccwgroup/drivers/\$NETTYPE/group"
+bus1=\`echo \$SUBCHANNELS | cut -d',' -f1\`
+echo "\$SUBCHANNELS" > /sys/bus/ccwgroup/drivers/\$NETTYPE/group
+if [ \$? -ne 0 ]; then
+    echo "Failed to group \$SUBCHANNELS in \$NETTYPE/group"
+    exit 1
+fi
+
+timedwait_for_path "/sys/bus/ccw/devices/\$bus1/group_device"
+group_device=\`readlink -f /sys/bus/ccw/devices/\$bus1/group_device\`
+if [ -z "\$group_device" ]; then
+    echo "Failed to find: /sys/bus/ccw/devices/\$bus1/group_device"
+    exit 1
+fi
+
+#set options
+if [ -n "\$OPTIONS" ]; then
+    for option in "\$OPTIONS"; do
+        opt_name=\`echo \$option | cut -d'=' -f1\`
+        opt_val=\`echo \$option | cut -d'=' -f2\`
+        echo \$opt_val > \$group_device/\$opt_name
+        if [ \$? -ne 0 ]; then
+            echo "Failed to set option \$group_device/\$opt_name"
+        fi
+    done
+fi
+
+if [ -n "\$PORTNAME" ]; then
+    echo \$PORTNAME > \$group_device/portname
+    if [ \$? -ne 0 ]; then
+        echo "Failed to set PORTNAME"
+    fi
+fi
+
+#bring online
+echo 1 > \$group_device/online
+if [ \$? -ne 0 ]; then
+    echo "Failed to bring \$DEVICE online"
+fi
+
+#set desired interface name
+ifname=\`cat \$group_device/if_name\`
+if [ "\$ifname" != "\$DEVICE" ]; then
+    echo "\$ifname != \$DEVICE"
+    ip link set dev \$ifname name \$DEVICE
+    if [ \$? -ne 0 ]; then
+        echo "Failed to rename: \$ifname -> \$DEVICE"
+    fi
+fi
+EOF
+    chmod a+x $SCRIPTDIR/ccw_net_init
+}
+
+emit_network()
+{
+    emit "if [ \$network_up -eq 0 ]"
+    emit "then"
+    emit "    for i in \`ls /etc/ifcfg-*\`"
+    emit "    do"
+    emit "        NETDEV=\`echo \$i | cut -d\"-\" -f2-\`"
+    emit "        map_interface \$NETDEV"
+    emit "    done"
+    emit "    rename_interfaces"
+    emit "    for IFACE in \`cat /etc/iface_to_activate\`"
+    emit "    do"
+    emit "        ifup \$IFACE"
+    emit "        IFADDR=\`ifconfig \$IFACE | awk '/inet addr/ {print \$2}' | cut -d\":\" -f 2\`"
+    emit "        if [ -z \"\$IFADDR\" ]"
+    emit "        then"
+    emit "            echo \"\$IFACE failed to come up\""
+    emit "        fi"
+    emit "  done"
+    emit "  add_route \"/etc/network/route-static\""
+    emit "  network_up=1"
+    emit "fi"
+}
+
+#DONT ADD STUFF to SCRIPTDIR PAST HERE
+for i in `ls $SCRIPTDIR/*`
+do
+    chmod 755 $i
+done
+
+if [ -e /etc/fstab.sys ]; then
+    inst /etc/fstab.sys "$MNTIMAGE/etc/fstab.sys"
+fi
+
+#build a good passwd file
+cat >> $MNTIMAGE/etc/passwd << EOF
+root:x:0:0:root:/root:/bin/bash
+EOF
+
+default_exclude_modules="snd soundcore cfg80211 mac80211 iwl virtio_balloon\
+ microcode mlx4_core"
+
+# $1: module basename
+exclude_module() {
+    local i
+
+    for i in $extra_kdump_mods; do
+        [[ "$1" =~ "$i" ]] && return 1
+    done
+
+    for i in $default_exclude_modules; do
+        [[ "$1" =~ "$i" ]] && return 0
+    done
+    return 1
+}
+
+mkdir -p $MNTIMAGE/lib/modules/$kernel
+for MODULE in $MODULES; do
+    _base_name=$(basename $MODULE)
+    if exclude_module $_base_name; then
+        MODULES=${MODULES/$MODULE/}
+        continue
+    fi
+    if [ -x /usr/bin/strip ]; then
+	/usr/bin/strip -g $verbose $MODULE -o $MNTIMAGE/lib/modules/$kernel/$_base_name
+    else
+	cp $verbose -a $MODULE $MNTIMAGE/lib/modules/$kernel/
+    fi
+    modinfo $MODULE | awk '/^firmware:/{print $2}' | while read firmware;
+    do
+        mkdir -p $(dirname $MNTIMAGE/lib/firmware/$firmware)
+        # if there is a kmod firmware
+        if [ -e /lib/firmware/updates/$firmware ]; then
+            cp /lib/firmware/updates/$firmware $MNTIMAGE/lib/firmware/$firmware
+        else
+            cp /lib/firmware/$firmware $MNTIMAGE/lib/firmware/$firmware
+        fi
+    done
+done
+depmod -b $MNTIMAGE/
+
+ln -sf ram1 $MNTIMAGE/dev/ram
+
+# FIXME -- this can really go poorly with clvm or duplicate vg names.
+# nash should do lvm probing for us and write its own configs.
+if [ -n "$vg_list" ]; then
+    inst /sbin/lvm "$MNTIMAGE/bin/lvm"
+    bin="$bin /sbin/lvm"
+    if [ -f /etc/lvm/lvm.conf ]; then
+	cp $verbose --parents /etc/lvm/lvm.conf $MNTIMAGE/
+    fi
+fi
+
+mkdir -p $MNTIMAGE/$FONTDIR
+inst $FONTDIR/${DEFAULT_FONT} $MNTIMAGE/$FONTDIR/
+
+echo -n >| $RCFILE
+cat >> $MNTIMAGE/init << EOF
+#!/bin/hush
+export PATH=$PATH:/scriptfns
+# Tell libdevmapper that there is no udev
+export DM_DISABLE_UDEV=1
+mount -t proc /proc /proc
+echo Mounting proc filesystem
+echo Mounting sysfs filesystem
+mount -t sysfs /sys /sys
+echo "/scriptfns/handle_event" > /sys/kernel/uevent_helper
+echo 1 > /proc/sys/vm/dirty_background_ratio
+echo 5 > /proc/sys/vm/dirty_ratio
+echo 10 > /proc/sys/vm/dirty_writeback_centisecs
+echo 50 > /proc/sys/vm/dirty_expire_centisecs
+echo Creating /dev
+mount -o mode=0755 -t tmpfs /dev /dev
+mkdir /dev/pts
+mount -t devpts -o gid=5,mode=620 /dev/pts /dev/pts
+mkdir /dev/shm
+mkdir /dev/mapper
+echo Creating initial device nodes
+mknod /dev/null c 1 3
+mknod /dev/zero c 1 5
+mknod /dev/systty c 4 0
+mknod /dev/tty c 5 0
+mknod /dev/console c 5 1
+mknod /dev/ptmx c 5 2
+mknod /dev/rtc c 254 0
+mknod /dev/urandom c 1 9
+mknod /dev/efirtc c 10 136
+export network_up=0
+setfont $FONTDIR/$DEFAULT_FONT -C /dev/console
+display_mem_usage
+set -o pipefail
+EOF
+
+# Some helper functions go here.
+cat >> $MNTIMAGE/init << EOF
+save_vmcore_dmesg_fs() {
+    local _dmesg_collector=\$1
+    local _path=\$2
+    local _exitcode
+
+    echo "Saving vmcore-dmesg.txt"
+    \$_dmesg_collector /proc/vmcore > \${_path}/vmcore-dmesg-incomplete.txt
+    _exitcode=\$?
+    if [ \$_exitcode -eq 0 ]; then
+        mv \${_path}/vmcore-dmesg-incomplete.txt \${_path}/vmcore-dmesg.txt
+	# Make sure file is on disk. There have been instances where later
+	# saving vmcore failed and system rebooted without sync and there
+	# was no vmcore-dmesg.txt available.
+        sync
+        echo "Saved vmcore-dmesg.txt"
+    else
+        echo "Saving vmcore-dmesg.txt failed"
+    fi
+
+    return \$_exitcode
+}
+
+save_vmcore_dmesg_ssh() {
+    local _dmesg_collector=\$1
+    local _path=\$2
+    local _opts="\$3"
+    local _location=\$4
+    local _exitcode
+
+    echo "Saving vmcore-dmesg.txt"
+    \$_dmesg_collector /proc/vmcore | ssh \$_opts \$_location "dd of=\$_path/vmcore-dmesg-incomplete.txt"
+    _exitcode=\$?
+
+    if [ \$_exitcode -eq 0 ]; then
+        ssh -q \$_opts \$_location mv \$_path/vmcore-dmesg-incomplete.txt \$_path/vmcore-dmesg.txt
+        echo "Saved vmcore-dmesg.txt"
+    else
+        echo "Saving vmcore-dmesg.txt failed"
+    fi
+
+    return \$_exitcode
+}
+
+wait_for_multipath_devices() {
+    local _found=0
+
+    while true
+    do
+        sleep 1
+        mpath_list=\$(dmsetup ls --target multipath 2> /dev/null | awk '{print \$1}')
+        for mpdev in $multipath_devices
+        do
+            # Also make sure the corresponding device node is created
+            if echo \$mpath_list | grep "\${mpdev##*/}" > /dev/null &&\
+                [ -e /dev/mapper/\${mpdev##*/} ]
+            then
+                _found=1
+            else
+                _found=0
+                break;
+            fi
+        done
+        [ \$_found -eq 1 ] && break
+        if [ -n "$DISK_TIMEOUT" -a "\$timeout_count" -ge "$DISK_TIMEOUT" ]
+        then
+            break
+        fi
+        timeout_count=\`expr \$timeout_count + 1\`
+    done
+}
+
+EOF
+
+# makedumpfile creates line mode terminal friendly output when TERM=dumb is set.
+if [ "$ARCH" == "s390x" ]; then
+    echo "export TERM=dumb" >> $MNTIMAGE/init
+fi
+
+# Linux on System z: Bring zfcp adapter and devices online
+emit_zfcp_device_init() {
+    local DEVICE WWPN FCPLUN
+
+    emit "echo Waiting 2 seconds for driver initialization."
+    emit "sleep 2"
+    cat /etc/zfcp.conf | grep -v "^#" | tr "A-Z" "a-z" | while read DEVICE WWPN FCPLUN; do
+    cemit <<EOF
+echo "free ${DEVICE/0x/}" > /proc/cio_ignore
+echo -n 1 > /sys/bus/ccw/drivers/zfcp/${DEVICE/0x/}/online
+echo -n 1 > /proc/cio_settle
+echo -n $WWPN > /sys/bus/ccw/drivers/zfcp/${DEVICE/0x/}/port_add
+echo -n $FCPLUN > /sys/bus/ccw/drivers/zfcp/${DEVICE/0x/}/$WWPN/unit_add
+display_mem_usage
+EOF
+    done
+}
+
+# Linux on System z: Bring DASD devices online
+emit_dasd_device_init() {
+    local DEVICE OPTIONS
+
+    cat /etc/dasd.conf | grep -v "^#" | tr "A-Z" "a-z" | while read DEVICE OPTIONS; do
+        test -n "$DEVICE" || continue
+	emit "echo "free ${DEVICE/0x/}" > /proc/cio_ignore"
+	emit "echo -n 1 > /proc/cio_settle"
+	emit "echo -n 1 > /sys/bus/ccw/devices/${DEVICE/0x/}/online"
+	# Set device options (if specified)
+	test -n "$OPTIONS" || continue
+	set $OPTIONS
+	while [ -n "$1" ]; do
+	    (
+		attribute="$1"
+		IFS="="
+		set $attribute
+		if [ $1 != "use_diag" ]; then
+		    emit "echo $2 > /sys/bus/ccw/devices/${DEVICE/0x/}/$1"
+		fi
+	    )
+	    shift
+	done
+    done
+}
+
+# XXX really we need to openvt too, in case someting changes the
+# color palette and then changes vts on fbcon before gettys start.
+# (yay, fbcon bugs!)
+for i in 0 1 2 3 4 5 6 7 8 9 10 11 12 ; do
+    emit "mknod /dev/tty$i c 4 $i"
+done
+
+for i in 0 1 2 3 ; do
+    emit "mknod /dev/ttyS$i c 4 $(($i + 64))"
+done
+make_trace_mem "At init start" 1+:mem 2+:iomem 3+:slab
+for MODULE in $MODULES; do
+    text=""
+    module=`echo $MODULE | sed "s|.*/||" | sed "s/.k\?o$//"`
+    # check if module is in blacklist
+    skipit=""
+    for m in $blacklist_mods; do
+        if [ $module == $m ]; then
+            skipit="skip"
+            break
+        fi
+    done
+    if [ ! -z "$skipit" ]; then
+        continue
+    fi
+    fullmodule=`echo $MODULE | sed "s|.*/||"`
+
+    if [ -n "$modulefile" ]
+    then
+        options=`sed -n -e "s/^options[ 	][ 	]*$module[ 	][ 	]*//p" $modulefile 2>/dev/null`
+    fi
+    if [ -n "$KDUMP_CONFIG_FILE" ]
+    then
+        options2=`sed -n -e "s/^options[    ][      ]*$module[      ][      ]*//p" $KDUMP_CONFIG_FILE 2>/dev/null`
+    fi
+
+    # Overwrite options if option is specified in kdump.conf
+    if [ -n "$options2" ]; then
+        options=$options2
+    fi
+
+
+    if [ -n "$options" ]; then
+        vecho "Adding module $module$text with options $options"
+    else
+        vecho "Adding module $module$text"
+    fi
+    emit "echo \"Loading $fullmodule module\""
+    emit "insmod /lib/modules/$kernel/$fullmodule $options"
+    make_trace_mem "After module $fullmodule has been loaded" 1:shortmem 2+:mem 3+:slab
+
+    # Hack - we need a delay after loading usb-storage to give things
+    #        time to settle down before we start looking a block devices
+    if [ "$module" = "usb-storage" ]; then
+	emit "echo Waiting 8 seconds for driver initialization."
+	emit "sleep 8"
+    fi
+    if [ "$module" = "zfcp" -a -f /etc/zfcp.conf ]; then
+        emit_zfcp_device_init
+    fi
+done
+
+# initialise network devices
+# arch specific setup before interfaces can be configured
+arch_netdev_init
+
+# Before we wait for block devices to come up, try to bring up any iscsi
+# devices and bring up the networking
+
+if [ -n "$ISCSI_DEVICES" ];then
+    # bring up the network
+    emit_network
+    # start iscsi
+    emit "iscsi_start"
+fi
+
+# Before we create our block devices, we need to make sure that we have all the needed block devices discovered
+# Thats seems like a chicken and egg problem, I know, but we generated  a critcal_disks list when we build this initramfs
+# that tell us what devices we need to wait to see in /sys/block
+
+# first bring DASDs online on s390
+if [ -f /etc/dasd.conf ]; then
+    emit_dasd_device_init
+fi
+
+cat >> $MNTIMAGE/init << EOF
+echo "Waiting for required block device discovery"
+block_mknod() {
+    local basename=\$1
+    local major minor minor_range part_sep
+
+    [ -b /dev/\$basename ] && return
+    major=\`cat /sys/block/\$basename/dev | cut -d":" -f1\`
+    minor=\`cat /sys/block/\$basename/dev | cut -d":" -f2\`
+    minor_range=\`cat /sys/block/\$basename/range | cut -d":" -f2\`
+    minor_end=\`echo \$minor \$minor_range + p | dc\`
+    minor_start=\`echo \$minor 1 + p | dc\`
+    part_num=1
+    part_sep=''
+    basename=\`echo \$basename | sed 's/\!/\//g'\`
+    if echo \$basename | grep -q '^cciss'; then
+        part_sep='p'
+    elif echo \$basename | grep -q '^ida'; then
+        part_sep='p'
+    fi
+    echo "Creating block device \$basename"
+    mknod /dev/\$basename b \$major \$minor
+    hdparm -z /dev/\$basename >/dev/null 2>/dev/null
+    if [ \$minor_range -gt 1 ]; then
+    for j in \`seq \$minor_start 1 \$minor_end\`
+    do
+       if [ ! -e /dev/\$basename\$part_num ]
+       then
+            mknod /dev/\$basename\$part_sep\$part_num b \$major \$j
+       fi
+       part_num=\`expr \$part_num + 1\`
+    done
+  fi
+}
+
+wait_critical_disks_by_vendor_model_type() {
+    for i in \`cat /etc/critical_disks | awk '{print \$1}'\`
+    do
+        IDSTRING=\`grep \$i /etc/critical_disks | awk '{print \$2}'\`
+        COUNT=\`grep \$i /etc/critical_disks | awk '{print \$3}'\`
+        found=0
+
+        echo -n "Waiting for \$COUNT \$i-like device(s)..."
+        while true
+        do
+            for j in \`ls /sys/block\`
+            do
+                DSKSTRING=""
+                TMPNAME=""
+                if [ ! -d /sys/block/\$j/device ]
+                then
+                    continue
+                fi
+                for a in "vendor" "model" "type"
+                do
+                    TMPNAME=\`cat /sys/block/\$j/device/\$a 2>/dev/null \`
+                    DSKSTRING="\$DSKSTRING \$TMPNAME"
+                done
+                DSKSTRING=\`echo \$DSKSTRING | sed -e's/ //g'\`
+                if [ "\$DSKSTRING" == "\$IDSTRING" ]
+                then
+                    found=\$((\$found + 1))
+                fi
+                if [ \$found -ge \$COUNT ]
+                then
+                    break 2
+                fi
+            done
+
+            sleep 1
+            if [ -n "$DISK_TIMEOUT" -a "\$timeout_count" -ge "$DISK_TIMEOUT" ]
+            then
+                break 2
+            fi
+            timeout_count=\`expr \$timeout_count + 1\`
+        done
+        echo Found
+        found=0
+    done
+}
+
+get_id_file_from_type() {
+    case \$1 in
+    scsi_ids)
+        echo "/etc/critical_scsi_ids"
+        ;;
+    virtio_ids)
+        echo "/etc/virtio_ids"
+        ;;
+    scm_ids)
+        echo "/etc/scm_ids"
+        ;;
+    dasd_bus_ids)
+        echo "/etc/dasd_bus_ids"
+        ;;
+    esac
+}
+
+#$1: id-type
+#$2: device name
+get_device_id() {
+    case \$1 in
+    scsi_ids)
+        echo \$(scsi_id --whitelisted --device=\$2 --replace-whitespace)
+        ;;
+    virtio_ids)
+        local majmin=\$(cat /sys/block/\$(basename \$2)/dev 2>/dev/null)
+        cat /sys/dev/block/\$majmin/serial 2>/dev/null
+        ;;
+    scm_ids)
+        basename \$(readlink /sys/block/\$(basename \$2)/device) 2>/dev/null
+        ;;
+    dasd_bus_ids)
+        basename \$(readlink /sys/block/\$(basename \$2)/device) 2>/dev/null
+        ;;
+    esac
+}
+
+_wait_critical_disks() {
+    local id_tmp=""
+    local nr_lines i line id
+    local idfile
+
+    # \$1==vendor_model_type means using old vendor/model/type sysfs attributes
+    # to idenfify the critical disks.
+    if [ "\$1" = "vendor_model_type" ]; then
+        wait_critical_disks_by_vendor_model_type
+        return \$?
+    fi
+
+    idfile=\$(get_id_file_from_type \$1)
+    #rhel6 hush does not support read line by line in a while loop, so..
+    nr_lines=\$(wc -l < "\$idfile")
+    for i in \`seq 1 \$nr_lines\`; do
+        id=\$(awk -v li=\$i 'NR==li {print}' \$idfile)
+
+        echo "Waiting for device with \$1: \$id ..."
+        while true; do
+            cd /sys/block
+            for j in *; do
+                [ ! -b /dev/\$j ] && block_mknod \$j
+                id_tmp=\$(get_device_id \$1 "/dev/\$j")
+                if [ "\$id" = "\$id_tmp" ]; then
+                    echo "Found device with \$1: \$id"
+                    break 2
+                fi
+            done
+            sleep 1
+            if [ -n "$DISK_TIMEOUT" -a "\$timeout_count" -ge "$DISK_TIMEOUT" ]
+            then
+                break 2
+            fi
+            timeout_count=\`expr \$timeout_count + 1\`
+        done
+    done
+}
+
+wait_critical_disks() {
+    if [ -f /etc/critical_scsi_ids ]; then
+        _wait_critical_disks scsi_ids
+    fi
+    if [ -f /etc/virtio_ids ]; then
+        _wait_critical_disks virtio_ids
+    fi
+    if [ -f /etc/scm_ids ]; then
+        _wait_critical_disks scm_ids
+    fi
+    if [ -f /etc/dasd_bus_ids ]; then
+        _wait_critical_disks dasd_bus_ids
+    fi
+    if [ -f /etc/critical_disks ]; then
+        _wait_critical_disks vendor_model_type
+    fi
+}
+
+timeout_count=0
+wait_critical_disks
+EOF
+
+make_trace_mem "After block device discovery" 1:shortmem 2+:mem 3+:slab
+
+# HACK: module loading + device creation isn't necessarily synchronous...
+# this will make sure that we have all of our devices before trying
+# things like RAID or LVM
+emit "echo Creating Remain Block Devices"
+emit "mkdir /dev/cciss"
+emit "mkdir /dev/ida"
+emit "for i in \`ls /sys/block\`; do"
+emit "  block_mknod \$i"
+emit "done"
+#now do any software raid devices we might have
+emit "if [ -f /etc/mdadm.conf ]"
+emit "then"
+emit "  for i in \`awk '/^ARRAY[[:space:]]/{print \$2}' /etc/mdadm.conf\`"
+emit "  do"
+emit "          MD_MIN=\`echo \$i | sed -e 's/^[^0-9]*\([0-9]\+\)$/\1/'\`"
+emit "          mknod \$i b 9 \$MD_MIN"
+emit "  done"
+emit "fi"
+
+make_trace_mem "After creation of block devices" 1:shortmem 2+:mem 3+:slab
+
+if [ -n "$vg_list" ]; then
+    emit "echo Making device-mapper control node"
+    emit "DM_MAJ=\`cat /proc/devices | grep misc | cut -d\" \" -f2\`"
+    emit "DM_MIN=\`cat /proc/misc | grep device-mapper | cut -d\" \" -f2\`"
+    emit "mknod /dev/mapper/control b \$DM_MAJ \$DM_MIN"
+fi
+
+# multipath
+if [ -n "$multipath_devices" ]; then
+    emit "echo Creating multipath devices"
+    emit "multipathd -B || multipathd"
+    emit "wait_for_multipath_devices"
+    emit "dmsetup ls --target multipath --exec 'kpartx -a -p p'"
+    # Create various multipath device nodes and links
+    #emit "process_multipath"
+fi
+
+if [ -n "$net_list" ]; then
+    for netdev in $net_list; do 
+	emit "echo Bringing up $netdev"
+	handle_netdev $netdev
+	#emit $network
+    done
+fi
+
+if [ -n "$raiddevices" ]; then
+    for dev in $raiddevices; do
+	cp -a /dev/${dev} $MNTIMAGE/dev
+	emit "#need code here to set up md devs"
+    done
+fi
+
+emit "if [ -f /etc/mdadm.conf ]"
+emit "then"
+emit "  mdadm -A -s"
+emit "display_mem_usage"
+emit "fi"
+
+if [ -n "$vg_list" ]; then
+    emit "echo Scanning logical volumes"
+    emit "lvm vgscan --ignorelockingfailure --mknodes"
+    emit "echo Activating logical volumes"
+    emit "lvm vgchange -a y --ignorelockingfailure"
+    emit "DM_NUM=0"
+    emit "for i in \`lvm lvs --noheadings -o lv_name,vg_name | sed -e's/ \\+/:/g'\`"
+    emit "do"
+    emit "   LV=\`echo \$i | awk -F\":\" '{ print \$2 }'\`"
+    emit "   VGRP=\`echo \$i | awk -F\":\" '{ print \$3 }'\`"
+    emit "   mkdir -p /dev/\$VGRP"
+    emit "   if [ ! -e /dev/\$VGRP/\$LV ]"
+    emit "   then"
+    emit "      ln -s /dev/mapper/\$VGRP-\$LV /dev/\$VGRP/\$LV"
+    emit "      DM_NUM=\`echo \$DM_NUM 1 + p | dc\`"
+    emit "      if [ -z \"\$noresume\" ]"
+    emit "      then"
+    emit "        /sbin/dmsetup resume /dev/mapper/\$VGRP-\$LV"
+    emit "      fi"
+    emit "   fi"
+    emit "done"
+    emit "display_mem_usage"
+fi
+
+make_trace_mem "After scanning logical volumes" 1:shortmem 2+:mem 3+:slab
+
+copysshenv()
+{
+    # Copy over the key itself.
+    dir=`dirname $SSH_KEY_LOCATION`
+    mkdir -p $MNTIMAGE/$dir
+    cp -a $SSH_KEY_LOCATION $MNTIMAGE/$SSH_KEY_LOCATION
+
+    # Copy over root and system-wide ssh configs.
+    if [ -f /root/.ssh/config ]; then
+        mkdir -p $MNTIMAGE/root/.ssh
+        chmod 700 $MNTIMAGE/root/.ssh
+        cp -a /root/.ssh/config $MNTIMAGE/root/.ssh/config
+    fi
+    if [ -f /etc/ssh/ssh_config ]; then
+        mkdir -p $MNTIMAGE/etc/ssh/
+        cp -a /etc/ssh/ssh_config $MNTIMAGE/etc/ssh/ssh_config
+    fi
+    
+    # Copy over any known_hosts files that would apply.
+    if [ -f /root/.ssh/known_hosts ]; then
+        mkdir -p $MNTIMAGE/root/.ssh
+        chmod 700 $MNTIMGE/root/.ssh
+        cp -a /root/.ssh/known_hosts $MNTIMAGE/root/.ssh/known_hosts
+    fi
+
+    if [ -f /etc/ssh/ssh_known_hosts ]; then
+        mkdir -p $MNTIMAGE/etc/ssh
+        cp -a /etc/ssh/ssh_known_hosts $MNTIMAGE/etc/ssh/ssh_known_hosts
+    fi
+
+    return 0
+}
+
+prepare_nfs4()
+{
+    grep '^nobody:' /etc/passwd >> "$MNTIMAGE/etc/passwd"
+    grep '^rpc:' /etc/passwd >> "$MNTIMAGE/etc/passwd"
+    grep '^rpcuser:' /etc/passwd >> "$MNTIMAGE/etc/passwd"
+    grep '^nobody:' /etc/group >> "$MNTIMAGE/etc/group"
+    grep '^rpc:' /etc/group >> "$MNTIMAGE/etc/group"
+    mkdir -m 0755 -p "$MNTIMAGE/var/lib/nfs/rpc_pipefs"
+    mkdir -m 0755 -p "$MNTIMAGE/var/lib/rpcbind"
+    mkdir -m 0755 -p "$MNTIMAGE/var/lib/nfs/statd/sm"
+    for f in /etc/netconfig /etc/idmapd.conf /etc/nsswitch.conf /etc/rpc /etc/protocols /etc/services
+    do
+        [ -f "$f" ] && cp "$f" $MNTIMAGE/$f
+    done
+    bin=" $bin /sbin/mount.nfs4 /usr/sbin/rpc.idmapd /sbin/rpc.statd /sbin/rpcbind"
+    [ -d /usr/lib64/libnfsidmap ] && k_extras="$k_extras $(echo /usr/lib64/libnfsidmap/*)"
+    [ -d /usr/lib/libnfsidmap ] && k_extras="$k_extras $(echo /usr/lib/libnfsidmap/*)"
+}
+
+enter_user_space()
+{
+if [ "$ARCH" != "s390x" ]; then
+    emit "echo Resetting kernel time value to BIOS time and timezone value to UTC."
+    emit "cp /etc/utctime /etc/localtime"
+    emit "hwclock --hctosys -l"
+fi
+emit "display_mem_usage"
+emit "echo Creating root device."
+emit "#check to see if we have root= on the command line"
+emit "ROOTDEV=\`cat /proc/cmdline | grep root=\`"
+emit "if [ -n \"\$ROOTDEV\" ]"
+emit "then"
+emit "   ROOTDEV=\`cat /proc/cmdline | sed 's/^.*root=//' | cut -d\" \" -f1\`"
+emit "   IS_LABEL=\`echo \$ROOTDEV | grep LABEL\`"
+emit "   IS_UUID=\`echo \$ROOTDEV | grep UUID\`"
+emit "   if [ -n \"\$IS_LABEL\" -o -n \"\$IS_UUID\" ] "
+emit "   then"
+emit "      ROOTDEV=\`findfs \"\$ROOTDEV\"\`"
+emit "   fi"
+emit "else"
+emit "   #we need to get the root major/minor from real-root-dev"
+emit "   ROOT_DEV_NR=\`cat /proc/sys/kernel/real-root-dev\`"
+emit "   ROOT_MIN=\`echo \$ROOT_DEV_NR | sed -e's/\\([0-9a-f]\\{1,2\\}\\)\\([0-9a-f]\\{2\\}\\)/\\2/'\`"
+emit "   ROOT_MAJ=\`echo \$ROOT_DEV_NR | sed -e's/\\([0-9a-f]\\{1,2\\}\\)\\([0-9a-f]\\{2\\}\\)/\\1/'\`"
+emit "   mknod /dev/rootdev b 0x\$ROOT_MAJ 0x\$ROOT_MIN"
+emit "   ROOTDEV=/dev/rootdev"
+emit "fi"
+
+emit "display_mem_usage"
+emit "echo Checking root filesystem."
+if [ "$DUMP_FSTYPE" = "btrfs" ] ;then
+emit "btrfsck \$ROOTDEV"
+emit "if [ \$? != 0 ]"
+emit "then"
+emit "   echo btrfsck \$ROOTDEV failed. Executing $FINAL_ACTION"
+emit "   $FINAL_ACTION"
+emit "fi"
+elif [ "$DUMP_FSTYPE" = "xfs" ] ;then
+emit "# xfs does not need fsck"
+else
+emit "fsck -p \$ROOTDEV"
+emit "if [ \$? -gt 1 ]"
+emit "then"
+emit "   echo fsck \$ROOTDEV failed. Executing $FINAL_ACTION"
+emit "   $FINAL_ACTION"
+emit "fi"
+fi
+emit "echo Mounting root filesystem: mount -t $rootfs \$ROOTDEV /sysroot"
+emit "mount -t $rootfs \$ROOTDEV /sysroot >/dev/null 2>&1 "
+emit "if [ \$? != 0 ]"
+emit "then"
+emit "   echo unable to mount rootfs. Dropping to shell"
+emit "   /bin/hush"
+emit "fi"
+
+emit "#move various filesystems and prime the rootfs to boot properly"
+emit "umount /proc"
+emit "mount -t proc proc /sysroot/proc"
+emit "umount /sys"
+emit "mount -t sysfs sysfs /sysroot/sys"
+emit "mount -o bind /dev /sysroot/dev"
+emit "load_selinux_policy /sysroot"
+
+emit "display_mem_usage"
+emit "touch /sysroot/fastboot"
+emit "echo Switching to new root and running init."
+emit "exec switch_root /sysroot /sbin/init"
+}
+
+if [ -n "$CLUSTER_NODE_LIST" ]; then
+    # bring up the network
+    emit_network
+    emit "fence_kdump_send $FENCE_KDUMP_OPTS $CLUSTER_NODE_LIST &"
+fi
+
+handle_default_action() {
+    if [ "$DEFAULT_ACTION" == "shell" ]
+    then
+        emit "echo dropping to initramfs shell"
+        emit "echo exiting this shell will reboot your system"
+        emit "/bin/hush"
+    fi
+    case $DEFAULT_ACTION in
+        reboot|halt|poweroff|shell)
+            emit "$FINAL_ACTION"
+            ;;
+        mount_root_run_init)
+            emit "echo Attempting to enter user-space to capture vmcore"
+            enter_user_space
+            ;;
+    esac
+}
+
+# normalize_path <path>
+# Prints the normalized path, where it removes any duplicated
+# and trailing slashes.
+# Example:
+# $ normalize_path ///test/test//
+# /test/test
+normalize_path() {
+    shopt -q -s extglob
+    set -- "${1//+(\/)//}"
+    shopt -q -u extglob
+    echo "${1%/}"
+}
+
+
+# convert_abs_rel <from> <to>
+# Prints the relative path, when creating a symlink to <to> from <from>.
+# Example:
+# $ convert_abs_rel /usr/bin/test /bin/test-2
+# ../../bin/test-2
+# $ ln -s $(convert_abs_rel /usr/bin/test /bin/test-2) /usr/bin/test
+convert_abs_rel() {
+    local __current __absolute __abssize __cursize __newpath
+    local -i __i __level
+
+    set -- "$(normalize_path "$1")" "$(normalize_path "$2")"
+
+    # corner case #1 - self looping link
+    [[ "$1" == "$2" ]] && { echo "${1##*/}"; return; }
+
+    # corner case #2 - own dir link
+    [[ "${1%/*}" == "$2" ]] && { echo "."; return; }
+
+    IFS="/" __current=($1)
+    IFS="/" __absolute=($2)
+
+    __abssize=${#__absolute[@]}
+    __cursize=${#__current[@]}
+
+    while [[ ${__absolute[__level]} == ${__current[__level]} ]]
+    do
+        (( __level++ ))
+        if (( __level > __abssize || __level > __cursize ))
+        then
+            break
+        fi
+    done
+
+    for ((__i = __level; __i < __cursize-1; __i++))
+    do
+        if ((__i > __level))
+        then
+            __newpath=$__newpath"/"
+        fi
+        __newpath=$__newpath".."
+    done
+
+    for ((__i = __level; __i < __abssize; __i++))
+    do
+        if [[ -n $__newpath ]]
+        then
+            __newpath=$__newpath"/"
+        fi
+        __newpath=$__newpath${__absolute[__i]}
+    done
+
+    echo "$__newpath"
+}
+
+# this func is used to setup fips environment.
+# please place it just above the final copy of bin and libs,
+# because it depends on the final collection of bin, kdump_libs
+# k_extra
+setup_fips()
+{
+    bin="$bin /usr/bin/fipscheck"
+
+    #ssh+fips require libraries that aren't found with ldd
+    if [ -e /usr/lib/libssl.so.10 ]; then
+        k_extras="$k_extras /usr/lib/libssl.so.10"
+    fi
+    if [ -e /usr/lib64/libssl.so.10 ]; then
+        k_extras="$k_extras /usr/lib64/libssl.so.10"
+    fi
+
+    # find all fips .hmac files
+    for n in $bin $kdump_libs $k_extras; do
+        _hmac=${n%/*}/.${n##*/}.hmac
+        if [[ -e "$_hmac" ]]; then
+            fips_hmac="$fips_hmac $_hmac"
+        fi
+    done
+}
+
+if [ -n "$KDUMP_CONFIG_FILE" ]; then
+    memtotal=`cat /proc/meminfo | grep MemTotal | awk '{print $2}'`
+    
+    #timezone info for date which outputs YYYY-MM-DD-hh:mm
+    cp /etc/localtime $MNTIMAGE/etc/localtime
+    if [ "$ARCH" != "s390x" ]; then
+        cp /usr/share/zoneinfo/UTC $MNTIMAGE/etc/utctime
+        cp /etc/adjtime $MNTIMAGE/etc/adjtime
+        emit "if grep -q UTC /etc/adjtime"
+        emit " then"
+        emit "    TIME_FORMAT=-u"
+        emit " else"
+        emit "    TIME_FORMAT=-l"
+        emit "fi"
+        emit "hwclock --hctosys \$TIME_FORMAT"
+    fi
+    emit "DATE=\`date +%Y-%m-%d-%T\`"
+
+    bin="$bin /sbin/dmsetup /sbin/kpartx" 
+
+    if [ -z "$CORE_COLLECTOR" ] || [ "${CORE_COLLECTOR%%[[:blank:]]*}" = "makedumpfile" ]
+    then
+        bin="$bin /usr/sbin/makedumpfile"
+    fi
+
+    #ssh, scp require libraries that aren't found with ldd
+    lib=/lib && [ -d "/lib64" -a "$ARCH" != "ppc64" ] && lib=/lib64
+    k_extras="/$lib/libnss_compat.so.2 /$lib/libnss_files.so.2 /$lib/libnss_dns.so.2"
+    if [ "$ARCH" = "ppc64" ]
+    then
+        k_extras="$k_extras /lib64/libnss_compat.so.2 /lib64/libnss_files.so.2 /lib64/libnss_dns.so.2"
+    fi
+
+    case "$USING_METHOD" in
+                raw)
+                    bin="$bin /sbin/blockdev"
+                    #test raw partition
+                    kdump_chk "dd if=$DUMP_TARGET count=1 of=/dev/null > /dev/null 2>&1" \
+                               "Bad raw partition $DUMP_TARGET"
+                    #check for available size is greater than $memtotal
+                    available_size=$(fdisk -s $DUMP_TARGET)
+                    if [ $available_size -lt $memtotal ]; then
+                        echo "Warning: There might not be enough space to save a vmcore."
+                        echo "         The size of $DUMP_TARGET should be greater than $memtotal kilo bytes."
+                    fi
+
+                    #setup raw case
+                    if [ -n "$KDUMP_PRE" ]
+                    then
+                        emit "$KDUMP_PRE"
+                        emit "if [ \$? -ne 0 ]"
+                        emit "then"
+                        emit "  echo kdump_pre script exited with non-zero status"
+                        emit "  $FINAL_ACTION"
+                        emit "fi"
+                    fi
+                    emit "echo Saving to partition $DUMP_TARGET"
+                    emit "display_mem_usage"
+                    make_trace_mem "Before dumping vmcore" 1:shortmem 2+:mem 3+:slab
+                    emit "monitor_dd_progress 512 &"
+                    if [ -z "$CORE_COLLECTOR" ]
+                    then
+                        CORE_COLLECTOR="makedumpfile -c --message-level 1 -d 31"
+                    else
+                        if [ "${CORE_COLLECTOR%%[[:blank:]]*}" != "makedumpfile" ]
+                        then
+                            echo "Warning: specifying a non-makedumpfile core collector, you will have to recover the vmcore manually."
+                        fi
+                    fi
+                    CORE_COLLECTOR=`echo $CORE_COLLECTOR | sed -e's/\(^makedumpfile\)\(.*$\)/\1 -F \2/'`
+                    emit "$CORE_COLLECTOR /proc/vmcore | dd of=$DUMP_TARGET bs=512 >> /tmp/dd_progress_file 2>&1"
+                    emit "exitcode=\$?"
+                    emit "if [ \$exitcode == 0 ]"
+                    emit "then"
+                    emit "  echo -e \"\\\033[0JSaving core complete\""
+                    emit "fi"
+                    emit "blockdev --flushbufs $DUMP_TARGET"
+                    make_trace_mem "After dumping vmcore" 1:shortmem 2+:mem 3+:slab
+                    if [ -x "$KDUMP_POST" ]; then
+                        emit "$KDUMP_POST \$exitcode"
+                    fi
+                    emit "[ \$exitcode == 0 ] && $FINAL_ACTION"
+                    ;;
+
+                nfs|nfs4|ssh)
+                    #build an /etc/passwd for scp to work properly
+                    grep "^root" /etc/passwd > $MNTIMAGE/etc/passwd
+
+                    # bring up the network
+                    emit_network
+                    if [ -n "$OFF_SUBNET" ]
+                    then
+                        # we are going to a different subnet
+                        lhost=`echo $OFF_SUBNET|awk '{print $7}'|head -n 1`
+                    else
+                        # we are on the same subnet
+                        lhost=`/sbin/ip route get to $remoteip 2>&1 |awk '{print $5}'|head -n 1`
+                    fi
+ 
+                    emit "echo Saving to remote location $DUMP_TARGET"
+                    if [ -z "`echo $DUMP_TARGET|grep @`" ]; then
+                        #NFS path
+                        if [ "$USING_METHOD" = "nfs4" ]
+                        then
+                            prepare_nfs4
+                        fi
+
+                        #test nfs mount and directory creation
+                        rlocation=`echo $DUMP_TARGET | sed 's/.*:/'"$remoteip"':/'`
+                        tmnt=`mktemp -dq`
+                        kdump_chk "mount -t $USING_METHOD -o nolock -o tcp $rlocation $tmnt" \
+                                   "Bad NFS mount $DUMP_TARGET"
+                        kdump_chk "mkdir -p $tmnt/$SAVE_PATH" "Read only NFS mount $DUMP_TARGET"
+                        kdump_chk "touch $tmnt/$SAVE_PATH/testfile" "Read only NFS mount $DUMP_TARGET"
+                        kdump_chk "rm -f $tmnt/$SAVE_PATH/testfile" "Read only NFS mount $DUMP_TARGET"
+
+                        tdir=`mktemp -dqp $tmnt/$SAVE_PATH`
+                        rc=$?
+                        available_size=$(df -P $tdir | tail -1 | tr -s ' ' ':' | cut -d: -f5)
+
+                        rm -rf $tdir
+                        umount -f $tmnt
+                        if [ $? != 0 ]; then
+                            rmdir $tmnt
+                            echo "Cannot unmount the temporary directory"
+                            cleanup_and_exit 1
+                        fi
+                        rm -rf $tmnt
+                        if [ $rc != "0" ]; then 
+                            echo "Cannot create directory in $DUMP_TARGET: $SAVE_PATH"
+                            cleanup_and_exit 1
+                        fi
+
+                        if [ -z "$CORE_COLLECTOR" ]; then
+                            CORE_COLLECTOR="makedumpfile -c --message-level 1 -d 31"
+                        fi
+
+                        #check for available size is greater than $memtotal
+                        if [ $available_size -lt $memtotal ]; then
+                            echo "Warning: There might not be enough space to save a vmcore."
+                            echo "         The size of $DUMP_TARGET should be greater than $memtotal kilo bytes."
+                        fi
+    
+                        #setup nfs case
+                        if [ -n "$KDUMP_PRE" ]
+                        then
+                            emit "$KDUMP_PRE"
+                            emit "if [ \$? -ne 0 ]"
+                            emit "then"
+                            emit "  echo kdump_pre script exited with non-zero status"
+                            emit "  $FINAL_ACTION"
+                            emit "fi"
+                        fi
+        
+                        mkdir -p $MNTIMAGE/mnt
+                        if [ "$USING_METHOD" = "nfs4" ]
+                        then
+                          emit "rpcbind"
+                          emit "[ ! -d /var/lib/nfs/rpc_pipefs/nfs ] && mount -t rpc_pipefs rpc_pipefs /var/lib/nfs/rpc_pipefs"
+                          emit "rpc.statd && rpc.idmapd"
+                          #the mount in busybox may not support NFS4
+                          emit "/sbin/mount.nfs4 $rlocation /mnt -o nolock"
+                        else
+                          emit "mount -t $USING_METHOD -o nolock -o tcp $rlocation /mnt"
+                        fi
+                        emit "exitcode=\$?"
+                        emit "if [ \$exitcode -eq 0 ]"
+                        emit "then"
+                        emit "  mkdir -p /mnt/$SAVE_PATH/$lhost-\$DATE"
+                        emit "  exitcode=\$?"
+                        emit "  if [ \$exitcode -eq 0 ]"
+                        emit "  then"
+                        # Save vmcore-dmesg.txt
+                        emit "    DMESG_PATH=/mnt/$SAVE_PATH/$lhost-\$DATE/"
+                        emit "    save_vmcore_dmesg_fs ${DMESG_COLLECTOR} \${DMESG_PATH}"
+                        # Save vmcore
+                        emit "    VMCORE=/mnt/$SAVE_PATH/$lhost-\$DATE/vmcore"
+                        emit "    export VMCORE"
+                        emit "    display_mem_usage"
+                        make_trace_mem "  Before dumping vmcore" 1:shortmem 2+:mem 3+:slab
+                        emit "    monitor_cp_progress \$VMCORE-incomplete &"
+                        emit "    $CORE_COLLECTOR /proc/vmcore \$VMCORE-incomplete "
+                        emit "    exitcode=\$?"
+                        emit "    if [ \$exitcode -eq 0 ]"
+                        emit "    then"
+                        emit "      mv \$VMCORE-incomplete \$VMCORE"
+                        emit "      echo -e \"\\\033[0JSaving core complete\""
+                        emit "    fi"
+                        emit "    umount -f /mnt"
+                        emit "  fi"
+                        emit "fi"
+                        make_trace_mem "  After dumping vmcore" 1:shortmem 2+:mem 3+:slab
+                        if [ -x "$KDUMP_POST" ]; then
+                          emit "$KDUMP_POST \$exitcode"
+                        fi
+                        emit "[ \$exitcode -eq 0 ] && $FINAL_ACTION"
+                    else
+                        #SSH path
+                        #rebuild $DUMP_TARGET replacing machine name with ip address
+                        if [ -n "$CORE_COLLECTOR" ]
+                        then
+                            CORE_COLLECTOR=`echo $CORE_COLLECTOR | sed -e's/\(^makedumpfile\)\(.*$\)/\1 -F \2/'`
+                        else
+                            CORE_COLLECTOR="makedumpfile -F -c --message-level 1 -d 31"
+                        fi
+
+                        bin="$bin /usr/bin/ssh /usr/bin/scp"
+                        rlocation=`echo $DUMP_TARGET|sed 's/@.*/@'"$rhost"'/'`
+                        #test ssh path and directory creation
+                        s_opts="-i $SSH_KEY_LOCATION -o BatchMode=yes"
+                        kdump_chk "ssh -q $s_opts $rlocation mkdir -p $SAVE_PATH </dev/null" \
+                                "Could not create $DUMP_TARGET:$SAVE_PATH, you probably need to run \"service kdump propagate\""
+                        tdir=`ssh -q $s_opts $rlocation mktemp -dqp $SAVE_PATH </dev/null`
+                        if [ $? != "0" ]; then
+                            echo "$KDUMP_CONFIG_FILE: Could not create temp directory in $DUMP_TARGET:$SAVE_PATH"
+                            cleanup_and_exit 1
+                        fi
+
+                        remote_df=`ssh -q $s_opts $rlocation df -P $tdir | tail -1`
+                        available_size=$(echo $remote_df | tr -s ' ' '|' | cut -d\| -f4)
+
+                        #check for available size is greater than $memtotal
+                        if [ $available_size -lt $memtotal ]; then
+                            echo "Warning: There might not be enough space to save a vmcore."
+                            echo "         The size of $rlocation:$tdir should be greater than $memtotal kilo bytes."
+                        fi
+                        #We do this to remove the temp directory from above
+                        ssh -q $s_opts $rlocation rmdir $tdir
+
+                        #setup ssh case, quick check to see if setup already
+                        if [ -n "$KDUMP_PRE" ]
+                        then
+                            emit "$KDUMP_PRE"
+                            emit "if [ \$? -ne 0 ]"
+                            emit "then"
+                            emit "  echo kdump_pre script exited with non-zero status"
+                            emit "  $FINAL_ACTION"
+                            emit "fi"
+                        fi
+
+                        if [ ! -r $MNTIMAGE/dev/urandom ]; then
+                            copysshenv
+                            mknod $MNTIMAGE/dev/urandom c 1 9
+                        fi
+                        emit "dd if=/var/lib/random-seed of=/dev/urandom 2>/dev/null"
+                        emit "ssh -q $s_opts $rlocation mkdir $SAVE_PATH/$lhost-\$DATE"
+                        # Save vmcore-dmesg.txt
+                        emit "DMESG_PATH=$SAVE_PATH/$lhost-\$DATE/"
+                        emit "save_vmcore_dmesg_ssh ${DMESG_COLLECTOR} \${DMESG_PATH} \"${s_opts}\" ${rlocation}"
+                        # Save vmcore
+                        emit "VMCORE=$SAVE_PATH/$lhost-\$DATE/vmcore"
+                        emit "export VMCORE"
+                        emit "display_mem_usage"
+                        make_trace_mem "Before dumping vmcore" 1:shortmem 2+:mem 3+:slab
+                        emit "monitor_scp_progress $rlocation $SAVE_PATH/$lhost-\$DATE/vmcore-incomplete &"
+                        # We need to restrict the use of core_collector here, if
+                        # its not makedumpfile, we need to ignore it as scp
+                        # requires that core_collector dump to stdout
+                        if [ "${CORE_COLLECTOR%%[[:blank:]]*}" == "makedumpfile" ]
+                        then
+                            emit "$CORE_COLLECTOR /proc/vmcore | ssh $s_opts $rlocation \"dd of=$SAVE_PATH/$lhost-\$DATE/vmcore-incomplete\""
+                        else
+                            emit "$CORE_COLLECTOR -q $s_opts /proc/vmcore $rlocation:\$VMCORE-incomplete"
+                        fi
+                        emit "exitcode=\$?"
+                        emit "if [ \$exitcode == 0 ]"
+                        emit "then"
+                        if [ -z "$CORE_COLLECTOR" ] || [ "${CORE_COLLECTOR%%[[:blank:]]*}" != "makedumpfile" ]
+                        then
+                            emit "  ssh -q $s_opts $rlocation mv \$VMCORE-incomplete \$VMCORE"
+                        else
+                            emit "  ssh -q $s_opts $rlocation mv \$VMCORE-incomplete \$VMCORE.flat"
+                        fi
+                        emit "  echo -e \"\\\033[0JSaving core complete\""
+                        emit "fi"
+                        make_trace_mem "After dumping vmcore" 1:shortmem 2+:mem 3+:slab
+                        if [ -x "$KDUMP_POST" ]; then
+                            emit "$KDUMP_POST \$exitcode"
+                        fi
+                        emit "[ \$exitcode -eq 0 ] && $FINAL_ACTION"
+                    fi
+                    ;;
+                *)
+                    #test filesystem and directory creation
+                    tmnt=`mktemp -dq`
+                    kdump_chk "mount -t $DUMP_FSTYPE $DUMP_TARGET $tmnt" "Bad mount point $DUMP_TARGET"
+                    mkdir -p $tmnt/$SAVE_PATH
+                    tdir=`mktemp -dqp $tmnt/$SAVE_PATH`
+                    rc=$?
+                    available_size=$(df $tdir | tail -1 | tr -s ' ' ':' | cut -d: -f4)
+                    rm -rf $tdir
+                    umount $tmnt
+                    if [ $? != 0 ]; then
+                        rmdir $tmnt
+                        echo "Cannot unmount the temporary directory"
+                        cleanup_and_exit 1
+                    fi
+                    rm -rf $tmnt
+                    if [ $rc != "0" ]; then 
+                        echo "Cannot create directory in $DUMP_TARGET: $SAVE_PATH"
+                        cleanup_and_exit 1
+                    fi
+                    #check for available size is greater than $memtotal
+                    if [ $available_size -lt $memtotal ]; then
+                        echo "Warning: There might not be enough space to save a vmcore."
+                        echo "         The size of $DUMP_TARGET should be greater than $memtotal kilo bytes."
+                    fi
+
+    
+                    #setup filesystem case
+
+                    if [ -n "$KDUMP_PRE" ]
+                    then
+                        emit "$KDUMP_PRE"
+                        emit "if [ \$? -ne 0 ]"
+                        emit "then"
+                        emit "  echo kdump_pre script exited with non-zero status"
+                        emit "  $FINAL_ACTION"
+                        emit "fi"
+                    fi
+
+                    mkdir -p $MNTIMAGE/mnt
+		    touch $MNTIMAGE/etc/mtab
+                    if [ -z "$CORE_COLLECTOR" ]; then
+                        CORE_COLLECTOR="makedumpfile -c --message-level 1 -d 31"
+                    fi
+                    emit "echo Saving to the local filesystem $DUMP_TARGET"
+                    emit "DUMPDEV=$DUMP_TARGET"
+                    emit "IS_LABEL=\`echo \$DUMPDEV | grep LABEL\`"
+                    emit "IS_UUID=\`echo \$DUMPDEV | grep UUID\`"
+                    emit "if [ -n \"\$IS_LABEL\" -o -n \"\$IS_UUID\" ] "
+                    emit "then"
+                    emit "  DUMPDEV=\`findfs \"\$DUMPDEV\"\`"
+                    emit "fi"
+                    if [ "$DUMP_FSTYPE" = "btrfs" ] ; then
+                    emit "btrfsck \$DUMPDEV"
+                    emit "if [ \$? != 0 ]"
+                    emit "then"
+                    emit "   echo btrfsck \$DUMPDEV failed. Executing default action"
+                    handle_default_action
+                    emit "fi"
+                    elif [ "$DUMP_FSTYPE" = "xfs" ] ; then
+                    emit "# xfs does not need fsck"
+                    else
+                    emit "fsck.$DUMP_FSTYPE -p \$DUMPDEV"
+                    emit "if [ \$? -gt 1 ]"
+                    emit "then"
+                    emit "   echo fsck.$DUMP_FSTYPE \$DUMPDEV failed. Executing default action"
+                    handle_default_action
+                    emit "fi"
+                    fi
+                    emit "mount -t $DUMP_FSTYPE \$DUMPDEV /mnt"
+                    emit "if [ \$? == 0 ]"
+                    emit "then"
+                    emit "  mkdir -p /mnt/$SAVE_PATH/127.0.0.1-\$DATE"
+                    emit "  VMCORE=/mnt/$SAVE_PATH/127.0.0.1-\$DATE/vmcore"
+                    emit "  export VMCORE"
+                    emit "  display_mem_usage"
+                    make_trace_mem "  Before selinux policy is loaded" 1:shortmem 2+:mem 3+:slab
+                    if [ "$CORE_COLLECTOR" == "cp" ]; then
+                        emit "  monitor_cp_progress \$VMCORE-incomplete &"
+                    fi
+		    emit "  load_selinux_policy /mnt"
+                    make_trace_mem "  Before dumping vmcore" 1:shortmem 2+:mem 3+:slab
+                    # Save vmcore-dmesg
+                    emit "  DMESG_PATH=/mnt/$SAVE_PATH/127.0.0.1-\$DATE/"
+                    emit "  save_vmcore_dmesg_fs ${DMESG_COLLECTOR} \${DMESG_PATH}"
+		    # Save vmcore
+                    emit "  $CORE_COLLECTOR /proc/vmcore \$VMCORE-incomplete "
+                    emit "  exitcode=\$?"
+                    emit "  if [ \$exitcode == 0 ]"
+                    emit "  then"
+                    emit "      mv \$VMCORE-incomplete \$VMCORE"
+                    emit "      echo -e \"\\\033[0JSaving core complete\""
+                    emit "  fi"
+                    emit "  sync"
+                    make_trace_mem "  After dumping vmcore" 1:shortmem 2+:mem 3+:slab
+                    if [ -x "$KDUMP_POST" ]; then
+                        emit "  $KDUMP_POST \$exitcode"
+                    fi
+                    emit "  [ -e /mnt/selinux ] && umount /mnt/selinux"
+                    emit "  umount /mnt"
+                    emit "  if [ \$exitcode == 0 ]"
+                    emit "  then"
+                    emit "    $FINAL_ACTION"
+                    emit "  fi"
+                    emit "fi"
+                    ;;
+    esac
+
+    #now handle the default action
+    handle_default_action
+
+    #find the shared libraries.  this snippet taken from kboot
+    TEMPLDCFG=`mktemp`
+    for lib in `ls /etc/ld.so.conf.d/* 2>/dev/null | grep -v kernelcap`
+    do
+        echo "include " $lib >> $TEMPLDCFG
+    done 
+    /sbin/ldconfig -f $TEMPLDCFG -N
+    kdump_libs=`for n in $bin; do 
+        ldd "$n" 2>/dev/null | tr -s '\011' ' ' | 
+        sed 's/.*=> *//;s/^ *//;/ *(0x.*)/s///p;d' 
+    done | sort | uniq | sed '/^ *$/d'`
+    rm -f $TEMPLDCFG 
+
+    if [ -f "$FIPS_FILE" ]; then
+        _fips_mode=$(cat $FIPS_FILE)
+        [ "$_fips_mode" -eq 1 ] && setup_fips
+    fi
+
+    #copy the binaries and their shared libraries to the archive
+    for n in $bin $kdump_libs $k_extras $fips_hmac; do
+        mkdir -p $MNTIMAGE/`dirname $n`
+        if [ -h $MNTIMAGE/$n ]; then
+            rm -f $MNTIMAGE/$n
+        fi
+
+        if [ -h $n ]; then
+            _real=$(readlink -f "$n")
+            mkdir -p $MNTIMAGE/`dirname $_real`
+            cp $_real $MNTIMAGE/$_real
+            ln -sfn $(convert_abs_rel $n $_real) $MNTIMAGE/$n
+        else
+            cp $n $MNTIMAGE/$n
+        fi
+    done
+fi
+
+
+chmod +x $RCFILE
+
+umask 0066
+(cd $MNTIMAGE; findall . | cpio --quiet -c -o) >| $IMAGE || cleanup_and_exit 1
+
+if [ -n "$compress" ]; then
+    gzip -9 < $IMAGE >| $target || rc=1
+else
+    cp -a $IMAGE $target || rc=1
+fi
+rm -rf $MNTIMAGE $IMAGE $TMPDISKLIST
+if [ -n "$MNTPOINT" ]; then rm -rf $MNTPOINT ; fi
+sync && sync
+exit $rc
