@@ -1,9 +1,7 @@
 <!DOCTYPE html>
 <html>
   <head>
-    <title><%= Ridealong_App(yield(:title)) %></title>
-    <%= stylesheet_link_tag 'application', media: 'all',
-                                           'data-turbolinks-track' => true %>
+    <title><%= yield(:title) %> | Ridealong App</title>
     <%= javascript_include_tag 'application', 'data-turbolinks-track' => true %>
     <%= csrf_meta_tags %>
     <!--[if lt IE 9]>
@@ -11,6 +9,7 @@
       </script>
     <![endif]-->
   </head>
+  <%= yield %>
   <body>
     <header class="navbar navbar-fixed-top navbar-inverse">
       <div class="container">

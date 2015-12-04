@@ -1,2 +1,14 @@
-<h1>StaticPages#home</h1>
-<p>Find me in app/views/static_pages/home.html.erb</p>
+<% provide(:title, "Home") %>
+<!DOCTYPE html>
+<html>
+  <body>
+    <%= yield %>
+    <div cless="center jumbotron">
+      <h1>Welcome to the Ridealong App</h1>
+
+      <a href="users#" class="btn btn-lg btn-primary">Sign up now!</a>
+    </div>
+
+    <img alt="Rails logo" src="/home/spiffysaxman/Ridealong-App/app/assets/rails.png" />
+  </body>
+</html>
