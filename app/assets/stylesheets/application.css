@@ -23,9 +23,13 @@
 body {
   padding-top: 60px;
 }
+ 
+@media (max-width: 979px) {
+  body {padding-top: 135px} 
+}
 
 section {
-  overflow: auto;
+  overflow: visible;
 }
 
 textarea {
