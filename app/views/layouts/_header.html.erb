@@ -1,10 +1,10 @@
 <header class="navbar navbar-fixed-top navbar-inverse">
   <div class="container">
-    <%= link_to "Ridealong App", 'static_pages', id: "logo" %>
+    <%= link_to "Ridealong App", root_path, id: "logo" %>
       <ul class="nav navbar-nav navbar-right">
-        <li><%= link_to "Help",   '#' %></li>
-        <li><%= link_to "Log in", 'users#index' %></li>
-	<li><%= link_to "Sign up", 'users#new' %></li>
+        <li><%= link_to "Help",   help_path %></li>
+        <li><%= link_to "Log in", '#' %></li>
+	<li><%= link_to "Sign up", signup_path %></li>
       </ul>
   </div>
 </header>

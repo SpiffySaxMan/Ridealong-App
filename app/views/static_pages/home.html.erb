@@ -5,10 +5,10 @@
 
     <div cless="center jumbotron">
       <h1>Welcome to the Ridealong App</h1>
-
-      <a href="users#index" class="btn btn-lg btn-primary">Sign up now!</a>
+      <%= link_to "Sign up now!", signup_path, class: "btn btn-lg btn-primary" %>
     </div>
 
-    <img alt="Rails logo" src="/assets/images/rails.png" />
+    <%= link_to image_tag("rails.png", alt: "Rails logo"),
+            'http://rubyonrails.org/' %>
   </body>
 </html>
