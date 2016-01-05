@@ -1,4 +1,5 @@
 class User < ActiveRecord::Base
+  has_many :microposts, dependent: :destroy
   attr_accessor :remember_token, :activation_token, :reset_token
   before_save   :downcase_email
   before_create :create_activation_digest
@@ -7,6 +8,7 @@ class User < ActiveRecord::Base
   validates :email, presence: true, length: { maximum: 255 },
 		    format: { with: VALID_EMAIL_REGEX },
                     uniqueness: true
+  validates :address,  presence: true
   has_secure_password
   validates :password, presence: true, length: { minimum: 6 }
 
