@@ -4,7 +4,7 @@ class UserTest < ActiveSupport::TestCase
 
   def setup
     @user = User.new(name: "Example User", email: "user@example.com",
-                     address: "9999 nw example st",
+                     address: "0000 NW example st",
                      password: "examplepassword", password_confirmation: "examplepassword")
   end
 
@@ -18,10 +18,12 @@ class UserTest < ActiveSupport::TestCase
     assert_not @user.valid?
   end
 
+
   test "address should be present" do
     @user.address = "     "
     assert_not @user.valid?
   end
+
 
   test "name should not be too long" do
     @user.name = "a" * 51
@@ -59,14 +61,6 @@ class UserTest < ActiveSupport::TestCase
   end
 
   test "authenticated? should return false for a user with nil digest" do
-    assert_not @user.authenticated?(:remember, '')
-  end
-
-  test "associated microposts should be destroyed" do
-    @user.save
-    @user.microposts.create!(content: "Lorem ipsum")
-    assert_difference 'Micropost.count', -1 do
-      @user.destroy
-    end
+    assert_not @user.authenticated?('')
   end
 end

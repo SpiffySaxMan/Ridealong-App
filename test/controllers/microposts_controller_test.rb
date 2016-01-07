@@ -36,6 +36,7 @@ class MicropostsControllerTest < ActionController::TestCase
 
   test "should update micropost" do
     patch :update, id: @micropost, micropost: { content: @micropost.content, user_id: @micropost.user_id }
+    assert_redirected_to micropost_path(assigns(:micropost))
   end
 
   test "should destroy micropost" do

@@ -9,9 +9,7 @@ User.create!(name:  "Example User",
              email: "example@northlandcaps.org",
              address: "0000 nw example st",
              password:              "foobar",
-             password_confirmation: "foobar",
-             activated: true,
-             activated_at: Time.zone.now)
+             password_confirmation: "foobar")
 
 99.times do |n|
   name  = Faker::Name.name
@@ -21,9 +19,7 @@ User.create!(name:  "Example User",
               email: email,
               address: "0000 nw example st",
               password:              password,
-              password_confirmation: password,
-              activated: true,
-              activated_at: Time.zone.now)
+              password_confirmation: password)
 users = User.order(:created_at).take(6)
 50.times do
   content = Faker::Lorem.sentence(5)

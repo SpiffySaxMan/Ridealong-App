@@ -1,35 +1,27 @@
 # Read about fixtures at http://api.rubyonrails.org/classes/ActiveRecord/FixtureSet.html
 william:
-  name: William Example
-  email: william@northlandcaps.org
+  name: William Bennett
+  email: wbennett@northlandcaps.org
   address: 7516 NW 78th st
   password_digest: <%= User.digest('password') %>
-  activated: true
-  activated_at: <%= Time.zone.now %>
 
 archer:
   name: Sterling Archer
   email: duchess@northlandcaps.org
   address: 9999 NE Archer st
   password_digest: <%= User.digest('password') %>
-  activated: true
-  activated_at: <%= Time.zone.now %>
 
 lana:
   name: Lana Kane
   email: hands@northlandcaps.org
   address: 9999 SW Lana st
   password_digest: <%= User.digest('password') %>
-  activated: true
-  activated_at: <%= Time.zone.now %>
 
 malory:
   name: Malory Archer
   email: boss@northlandcaps.org
   address: 9999 E Malory blvd
   password_digest: <%= User.digest('password') %>
-  activated: true
-  activated_at: <%= Time.zone.now %>
 
 <% 30.times do |n| %>
 user_<%= n %>:
@@ -37,6 +29,4 @@ user_<%= n %>:
   email: <%= "user-#{n}@northlandcaps.org" %>
   address: <%= "user-#{n} NW example st" %>
   password_digest: <%= User.digest('password') %>
-  activated: true
-  activated_at: <%= Time.zone.now %>
 <% end %>
