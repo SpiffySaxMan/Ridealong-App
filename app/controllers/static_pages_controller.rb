@@ -6,6 +6,10 @@ class StaticPagesController < ApplicationController
     end
   end
 
+  def address
+    address = User.address
+  end
+
   def help
   end
 

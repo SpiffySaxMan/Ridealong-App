@@ -2,8 +2,10 @@
   <div class="container">
     <%= link_to "Ridealong App", root_path, id: "logo" %>
       <ul class="nav navbar-nav navbar-right">
-        <li><%= link_to "Help",   help_path %></li>
-	<li><%= link_to "Sign up", signup_path %></li>
+        <li><%= link_to "Home",   root_path %></li>
+        <% unless logged_in? %>
+          <li><%= link_to "Sign up", signup_path %></li>
+        <% else %>
         <% if logged_in? %>
           <li><%= link_to "Users", '#' %></li>
           <li class="dropdown">
@@ -22,6 +24,7 @@
         <% else %>
           <li><%= link_to "Log in", login_path %></li>
         <% end %>
+      <% end %>
       </ul>
   </div>
 </header>

@@ -12,7 +12,7 @@ class User < ActiveRecord::Base
   validates :password, presence: true, length: { minimum: 6 }
 
   def feed
-    Micropost.where("user_id = ?", id)
+    Micropost.all
   end
 
   # Returns the hash digest of the given string.
